@@ -1,0 +1,2784 @@
+diff --git a/epsilon/Makefile b/epsilon/Makefile
+index 1d61e14f13..923207081d 100644
+--- a/epsilon/Makefile
++++ b/epsilon/Makefile
+@@ -2,7 +2,7 @@
+ 
+ PATH_haussmann := ../haussmann
+ APP_NAME := Epsilon
+-APP_VERSION := 26.1.0
++APP_VERSION := 26.4.0
+ OUTPUT_ROOT := output
+ DEBUG ?= 0
+ PLATFORM ?= host
+diff --git a/epsilon/apps/apps_container.cpp b/epsilon/apps/apps_container.cpp
+index c2fe7f4016..a5690add16 100644
+--- a/epsilon/apps/apps_container.cpp
++++ b/epsilon/apps/apps_container.cpp
+@@ -239,7 +239,8 @@ void AppsContainer::switchToBuiltinApp(App::Snapshot* snapshot) {
+ #ifdef HARDWARE_CHECKUP
+       snapshot == hardwareCheckupAppSnapshot() ||
+ #endif
+-      snapshot == onBoardingAppSnapshot()) {
++      snapshot == onBoardingAppSnapshot() ||
++      snapshot == homeAppSnapshot()) {
+     m_window.hideTitleBarView(true);
+   } else {
+     m_window.hideTitleBarView(false);
+@@ -313,6 +314,16 @@ void AppsContainer::run() {
+   Ion::Events::setSpinner(true);
+   Ion::Display::setScreenshotCallback(ShowCursor);
+ 
++  /* PSP-OS: this userland is started by the official one (slot A) through
++   * DFU. The kernel may still hold the checkpoints that the official userland
++   * set, and setCheckpoint ignores a checkpoint that is already set: Home (or
++   * waking up from On/Off) would then jump back into slot A's userland. Drop
++   * them so that our own Home checkpoint is the one the kernel uses. */
++  Ion::CircuitBreaker::unsetCheckpoint(
++      Ion::CircuitBreaker::CheckpointType::AnyKey);
++  Ion::CircuitBreaker::unsetCheckpoint(Ion::CircuitBreaker::CheckpointType::Back);
++  Ion::CircuitBreaker::unsetCheckpoint(Ion::CircuitBreaker::CheckpointType::Home);
++
+   /* Setup the home checkpoint so that the exception checkpoint will be
+    * reactivated on a home interrupt. This way, the main exception checkpoint
+    * will keep the home checkpoint as parent. */
+diff --git a/epsilon/apps/home/app.h b/epsilon/apps/home/app.h
+index 97ab41c37b..7bb2add588 100644
+--- a/epsilon/apps/home/app.h
++++ b/epsilon/apps/home/app.h
+@@ -22,6 +22,8 @@ class App : public Escher::App {
+     const Descriptor* descriptor() const override;
+   };
+   static App* app() { return static_cast<App*>(Escher::App::app()); }
++  int animationPeriod() override { return Controller::k_animationPeriod; }
++  bool animationFrame() override { return m_controller.animationFrame(); }
+   Snapshot* snapshot() {
+     return static_cast<Snapshot*>(Escher::App::snapshot());
+   }
+diff --git a/epsilon/apps/home/controller.cpp b/epsilon/apps/home/controller.cpp
+index 3b79f585f4..43457c7e9b 100644
+--- a/epsilon/apps/home/controller.cpp
++++ b/epsilon/apps/home/controller.cpp
+@@ -3,10 +3,17 @@
+ #include <apps/apps_container.h>
+ #include <apps/exam_mode_manager.h>
+ #include <apps/home/apps_layout.h>
+-#include <ion/keyboard/layout_events.h>
+-#include <poincare/preferences.h>
++#include <apps/i18n.h>
++#include <ion/battery.h>
++#include <ion/timing.h>
++#include <kandinsky/font.h>
++#include <math.h>
++#include <omg/memory.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "app.h"
++#include "switch/switch_icons.h"
+ 
+ extern "C" {
+ #include <assert.h>
+@@ -15,166 +22,757 @@ extern "C" {
+ using namespace Escher;
+ using namespace Poincare;
+ 
+-namespace Home {
++namespace {
++
++/* ---------------------------------------------------------------------------
++ * Band rendering: the screen is composed in RAM, one horizontal band at a
++ * time (background + icons + text), and each finished band is pushed to the
++ * LCD in one go. No flicker, and partial redraws stay cheap. */
++
++constexpr KDCoordinate k_width = Ion::Display::Width;
++constexpr KDCoordinate k_height = Ion::Display::Height;
++constexpr KDCoordinate k_bandHeight = 16;
++
++KDColor s_band[k_width * k_bandHeight];
++
++class BandContext : public KDContext {
++ public:
++  BandContext(KDCoordinate y0, KDCoordinate h)
++      : KDContext(KDPointZero, KDRect(0, y0, k_width, h)), m_y0(y0) {}
++  KDColor* row(KDCoordinate y) { return s_band + (y - m_y0) * k_width; }
++  KDCoordinate top() const { return m_y0; }
++  KDCoordinate bottom() const { return clippingRect().bottom(); }
++
++ protected:
++  void pushRect(KDRect rect, const KDColor* pixels) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      memcpy(row(rect.y() + j) + rect.x(), pixels + j * rect.width(),
++             rect.width() * sizeof(KDColor));
++    }
++  }
++  void pushRectUniform(KDRect rect, KDColor color) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      KDColor* r = row(rect.y() + j) + rect.x();
++      for (KDCoordinate i = 0; i < rect.width(); i++) {
++        r[i] = color;
++      }
++    }
++  }
++  void pullRect(KDRect rect, KDColor* pixels) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      memcpy(pixels + j * rect.width(), row(rect.y() + j) + rect.x(),
++             rect.width() * sizeof(KDColor));
++    }
++  }
+ 
+-Controller::ContentView::ContentView(
+-    Controller* controller, SelectableTableViewDataSource* selectionDataSource)
+-    : m_selectableTableView(controller, controller, selectionDataSource,
+-                            controller) {
+-  m_selectableTableView.setVerticalCellOverlap(0);
+-  m_selectableTableView.setMargins(k_margins);
+-  m_selectableTableView.setBackgroundColor(ThemeComponent::DefaultBackground);
+-  m_selectableTableView.decorator()->setVerticalMargins(
+-      {k_indicatorMargin, k_indicatorMargin - k_bottomMargin});
++ private:
++  KDCoordinate m_y0;
++};
++
++/* ---------------------------------------------------------------- colours */
++
++constexpr KDColor k_background = KDColor::RGB24(0xEBEBEB);
++constexpr KDColor k_ink = KDColor::RGB24(0x2D2D2D);
++constexpr KDColor k_inkLight = KDColor::RGB24(0x6E6E6E);
++constexpr KDColor k_cyan = KDColor::RGB24(0x00C3E3);
++constexpr KDColor k_cyanText = KDColor::RGB24(0x00A6C8);
++constexpr KDColor k_cyanLight = KDColor::RGB24(0x7FE6F7);
++constexpr KDColor k_emptyTile = KDColor::RGB24(0xE2E2E2);
++constexpr KDColor k_emptyTileBorder = KDColor::RGB24(0xD6D6D6);
++constexpr KDColor k_lockBackground = KDColor::RGB24(0x2D2D2D);
++constexpr KDColor k_lockPanel = KDColor::RGB24(0x1E1E1E);
++constexpr KDColor k_lockSlot = KDColor::RGB24(0x3A3A3A);
++
++KDColor mix(KDColor a, KDColor b, float t) {
++  int alpha = static_cast<int>(t * 255);
++  alpha = alpha < 0 ? 0 : (alpha > 255 ? 255 : alpha);
++  return KDColor::Blend(a, b, alpha);
+ }
+ 
+-SelectableTableView* Controller::ContentView::selectableTableView() {
+-  return &m_selectableTableView;
++/* ------------------------------------------------------------------ masks */
++
++// Blend an A8 mask into the band, centered on (cx, cy).
++void blendMask(BandContext* ctx, const uint8_t* mask, int size, int cx, int cy,
++               KDColor color, int opacity = 256) {
++  int x0 = cx - size / 2;
++  int y0 = cy - size / 2;
++  int jStart = ctx->top() - y0;
++  if (jStart < 0) jStart = 0;
++  int jEnd = ctx->bottom() - y0 + 1;
++  if (jEnd > size) jEnd = size;
++  for (int j = jStart; j < jEnd; j++) {
++    KDColor* r = ctx->row(y0 + j);
++    const uint8_t* m = mask + j * size;
++    for (int i = 0; i < size; i++) {
++      int x = x0 + i;
++      if (x < 0 || x >= k_width || m[i] == 0) {
++        continue;
++      }
++      r[x] = KDColor::Blend(color, r[x], (m[i] * opacity) >> 8);
++    }
++  }
+ }
+ 
+-void Controller::ContentView::reloadBottomRow(
+-    SimpleTableViewDataSource* dataSource, int lastIconColumn) {
+-  /* We mark the missing icons on the last row as dirty. */
+-  for (int i = lastIconColumn + 1; i < dataSource->numberOfColumns(); i++) {
+-    markRectAsDirty(KDRect(dataSource->columnWidth(0) * i,
+-                           dataSource->rowHeight(0), dataSource->columnWidth(0),
+-                           dataSource->rowHeight(0)));
++void fillRect(BandContext* ctx, int x, int y, int w, int h, KDColor c,
++              int opacity = 256) {
++  int y0 = y < ctx->top() ? ctx->top() : y;
++  int y1 = y + h - 1 > ctx->bottom() ? ctx->bottom() : y + h - 1;
++  int x0 = x < 0 ? 0 : x;
++  int x1 = x + w > k_width ? k_width : x + w;
++  for (int yy = y0; yy <= y1; yy++) {
++    KDColor* r = ctx->row(yy);
++    for (int xx = x0; xx < x1; xx++) {
++      r[xx] = opacity >= 256 ? c : KDColor::Blend(c, r[xx], opacity - 1);
++    }
+   }
+ }
+ 
+-View* Controller::ContentView::subviewAtIndex(int index) {
+-  assert(index == 0);
+-  return &m_selectableTableView;
++// Rectangle outline of the given thickness, outside of (x, y, w, h)
++void strokeAround(BandContext* ctx, int x, int y, int w, int h, int thickness,
++                  KDColor c, int opacity) {
++  fillRect(ctx, x - thickness, y - thickness, w + 2 * thickness, thickness, c,
++           opacity);
++  fillRect(ctx, x - thickness, y + h, w + 2 * thickness, thickness, c, opacity);
++  fillRect(ctx, x - thickness, y, thickness, h, c, opacity);
++  fillRect(ctx, x + w, y, thickness, h, c, opacity);
+ }
+ 
+-void Controller::ContentView::layoutSubviews(bool force) {
+-  /* Selectable table view's bottom margin is used for vertical scroll: we
+-   * scroll to the selected cell's farthest pixel + bottom margin. For home app,
+-   * instead of having a bottom margin, we reduce the frame of the selectable
+-   * table view and ContentView::drawRect will take care of drawing the white
+-   * pixels at the bottom of the screen. */
+-  KDRect frame =
+-      KDRect(KDPointZero, bounds().width(), bounds().height() - k_bottomMargin);
+-  setChildFrame(&m_selectableTableView, frame, force);
++/* ------------------------------------------------------------------- text */
++
++/* Text is rasterized white-on-black off-screen; the luminance is the glyph
++ * coverage, used as an alpha mask to blend the text over the background. */
++constexpr KDCoordinate k_textBufferHeight = 24;
++KDColor s_textBuffer[k_width * k_textBufferHeight];
++
++class TextContext : public KDContext {
++ public:
++  TextContext()
++      : KDContext(KDPointZero, KDRect(0, 0, k_width, k_textBufferHeight)) {}
++
++ protected:
++  void pushRect(KDRect rect, const KDColor* pixels) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      memcpy(s_textBuffer + (rect.y() + j) * k_width + rect.x(),
++             pixels + j * rect.width(), rect.width() * sizeof(KDColor));
++    }
++  }
++  void pushRectUniform(KDRect rect, KDColor color) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      KDColor* r = s_textBuffer + (rect.y() + j) * k_width + rect.x();
++      for (KDCoordinate i = 0; i < rect.width(); i++) {
++        r[i] = color;
++      }
++    }
++  }
++  void pullRect(KDRect rect, KDColor* pixels) override {
++    for (KDCoordinate j = 0; j < rect.height(); j++) {
++      memcpy(pixels + j * rect.width(),
++             s_textBuffer + (rect.y() + j) * k_width + rect.x(),
++             rect.width() * sizeof(KDColor));
++    }
++  }
++};
++
++enum class Align { Left, Center, Right };
++
++void drawText(BandContext* ctx, const char* text, int x, int cy,
++              KDFont::Size font, KDColor color, Align align = Align::Left,
++              int opacity = 256) {
++  KDSize size = KDFont::Font(font)->stringSize(text);
++  int y = cy - size.height() / 2;
++  if (y > ctx->bottom() || y + size.height() < ctx->top() || opacity <= 0) {
++    return;
++  }
++  if (align == Align::Center) {
++    x -= size.width() / 2;
++  } else if (align == Align::Right) {
++    x -= size.width();
++  }
++  int w = size.width() > k_width ? k_width : size.width();
++  int h = size.height() > k_textBufferHeight ? k_textBufferHeight
++                                              : size.height();
++  TextContext textContext;
++  textContext.fillRect(KDRect(0, 0, w, h), KDBlack);
++  textContext.drawString(
++      text, KDPointZero,
++      {.glyphColor = KDWhite, .backgroundColor = KDBlack, .font = font});
++  for (int j = 0; j < h; j++) {
++    int yy = y + j;
++    if (yy < ctx->top() || yy > ctx->bottom()) {
++      continue;
++    }
++    KDColor* r = ctx->row(yy);
++    const KDColor* src = s_textBuffer + j * k_width;
++    for (int i = 0; i < w; i++) {
++      int xx = x + i;
++      uint8_t a = src[i].green();
++      if (xx < 0 || xx >= k_width || a == 0) {
++        continue;
++      }
++      r[xx] = KDColor::Blend(color, r[xx], (a * opacity) >> 8);
++    }
++  }
+ }
+ 
+-Controller::Controller(Responder* parentResponder,
+-                       SelectableTableViewDataSource* selectionDataSource)
+-    : ViewController(parentResponder), m_view(this, selectionDataSource) {}
++/* ----------------------------------------------------------- status icons */
+ 
+-bool Controller::handleEvent(Ion::Events::Event event) {
+-  if (event == Ion::Events::OK || event == Ion::Events::EXE) {
+-    switchToSelectedApp();
+-    return true;
++void drawBattery(BandContext* ctx, KDColor color) {
++  constexpr int x = 284, y = 10, w = 24, h = 12;
++  if (y > ctx->bottom() || y + h < ctx->top()) {
++    return;
+   }
+-  if (event == Ion::Events::Home || event == Ion::Events::Back) {
+-    m_view.selectableTableView()->selectCellAtLocation(0, 0);
+-    return true;
++  fillRect(ctx, x, y, w, 1, color);
++  fillRect(ctx, x, y + h - 1, w, 1, color);
++  fillRect(ctx, x, y, 1, h, color);
++  fillRect(ctx, x + w - 1, y, 1, h, color);
++  fillRect(ctx, x + w, y + 3, 2, h - 6, color);  // terminal
++  int level = static_cast<int>(Ion::Battery::level());  // 0..5
++  int fill = (w - 4) * level / 5;
++  KDColor fillColor = level <= 1 ? KDColor::RGB24(0xE60012) : color;
++  fillRect(ctx, x + 2, y + 2, fill, h - 4, fillColor);
++  if (Ion::Battery::isCharging()) {
++    KDColor bolt = KDColor::RGB24(0x2EB82E);
++    int bx = x - 10;
++    for (int i = 0; i < 6; i++) {
++      fillRect(ctx, bx + 4 - i / 2, y + i, 2, 1, bolt);
++    }
++    fillRect(ctx, bx + 1, y + 6, 5, 1, bolt);
++    for (int i = 0; i < 5; i++) {
++      fillRect(ctx, bx + 4 - i / 2, y + 7 + i, 2, 1, bolt);
++    }
+   }
+-  if (event == Ion::Events::Right &&
+-      selectionDataSource()->selectedRow() < numberOfRows() - 1) {
+-    m_view.selectableTableView()->selectCellAtLocation(
+-        0, selectionDataSource()->selectedRow() + 1);
+-    return true;
++}
++
++/* -------------------------------------------------------------- game tile */
++
++constexpr int k_iconWidth = 55;
++constexpr int k_iconHeight = 56;
++/* The icon is decompressed into the text buffer: both are never used at the
++ * same time, and the userland RAM has no room for another 6 KB. */
++KDColor* const s_icon = s_textBuffer;
++static_assert(k_iconWidth * k_iconHeight <= k_width * k_textBufferHeight,
++              "The text buffer must be able to hold a game icon");
++
++/* Draws the game's own icon (55x56, compressed in the .nwa) scaled to fill a
++ * square tile, like a game card on the Switch. */
++void drawGameTile(BandContext* ctx, int x, int y, int size,
++                  const Ion::ExternalApps::App& app, int opacity) {
++  if (y > ctx->bottom() || y + size < ctx->top()) {
++    return;
+   }
+-  if (event == Ion::Events::Left && selectionDataSource()->selectedRow() > 0) {
+-    m_view.selectableTableView()->selectCellAtLocation(
+-        k_numberOfColumns - 1, selectionDataSource()->selectedRow() - 1);
+-    return true;
++  const uint8_t* data = app.iconData();
++  uint32_t dataSize = app.iconSize();
++  if (data == nullptr || dataSize == 0) {
++    fillRect(ctx, x, y, size, size, KDColor::RGB24(0x9AA0A6), opacity);
++    return;
++  }
++  OMG::Memory::Decompress(data, reinterpret_cast<uint8_t*>(s_icon), dataSize,
++                          k_iconWidth * k_iconHeight * sizeof(KDColor));
++  int y0 = y < ctx->top() ? ctx->top() : y;
++  int y1 = y + size - 1 > ctx->bottom() ? ctx->bottom() : y + size - 1;
++  for (int yy = y0; yy <= y1; yy++) {
++    int sy = (yy - y) * k_iconHeight / size;
++    const KDColor* src = s_icon + sy * k_iconWidth;
++    KDColor* dst = ctx->row(yy);
++    for (int i = 0; i < size; i++) {
++      int xx = x + i;
++      if (xx < 0 || xx >= k_width) {
++        continue;
++      }
++      KDColor c = src[i * k_iconWidth / size];
++      dst[xx] = opacity >= 256 ? c : KDColor::Blend(c, dst[xx], opacity - 1);
++    }
++  }
++}
++
++/* ------------------------------------------------------------------ layout */
++
++// Top bar
++constexpr int k_topBarY = 16;
++// Games row
++constexpr int k_tileSize = 84;
++constexpr int k_tileY = 50;
++constexpr int k_tileStep = 94;
++constexpr int k_firstTileX = 22;
++constexpr int k_visibleTiles = 3;
++// Apps row
++constexpr int k_buttonY = 174;
++constexpr int k_buttonStep = 40;
++constexpr int k_firstButtonX = 40;
++constexpr int k_visibleButtons = 7;
++// Bottom bar
++constexpr int k_bottomLineY = 216;
++constexpr int k_bottomBarY = 229;
++
++enum ItemIcon : uint8_t {
++  IconCalculation = 0,
++  IconSolver,
++  IconFinance,
++  IconGraph,
++  IconSequence,
++  IconRegression,
++  IconStatistics,
++  IconDistributions,
++  IconInference,
++  IconElements,
++  IconCode,
++  IconSettings,
++  IconUMD,
++};
++
++struct AppPlacement {
++  I18n::Message name;
++  uint8_t icon;
++  uint32_t color;
++};
++
++// Order and colours of the round buttons (Settings last, like on the Switch)
++constexpr AppPlacement k_placements[] = {
++    {I18n::Message::CalculApp, IconCalculation, 0xE60012},
++    {I18n::Message::FunctionApp, IconGraph, 0x0AB9E6},
++    {I18n::Message::SolverApp, IconSolver, 0xFF8A00},
++    {I18n::Message::StatsApp, IconStatistics, 0xF5A700},
++    {I18n::Message::DistributionsApp, IconDistributions, 0x00A88F},
++    {I18n::Message::SequenceApp, IconSequence, 0x7B5CFF},
++    {I18n::Message::RegressionApp, IconRegression, 0xE6007E},
++    {I18n::Message::InferenceApp, IconInference, 0x4A6CF7},
++    {I18n::Message::FinanceApp, IconFinance, 0x2EB82E},
++    {I18n::Message::CodeApp, IconCode, 0x3776AB},
++    {I18n::Message::ElementsApp, IconElements, 0x9B59B6},
++    {I18n::Message::SettingsApp, IconSettings, 0x6E6E6E},
++};
++
++// Selection survives leaving / re-entering the home app
++int s_game = 0;
++int s_app = 0;
++Home::Controller::Row s_row = Home::Controller::Row::Games;
++bool s_lockScreenShown = false;
++
++#if !PLATFORM_DEVICE
++/* Simulator-only test hook: with PSP_ANIM_AT set, animations jump to their
++ * final state so that headless screenshots show settled screens. */
++bool snapForTests() { return getenv("PSP_ANIM_AT") != nullptr; }
++#else
++constexpr bool snapForTests() { return false; }
++#endif
++
++}  // namespace
++
++namespace Home {
++
++/* ------------------------------------------------------------------ view */
++
++void Controller::ContentView::drawRect(KDContext* ctx, KDRect rect) const {
++  KDCoordinate start = (rect.top() / k_bandHeight) * k_bandHeight;
++  for (KDCoordinate y = start; y <= rect.bottom() && y < k_height;
++       y += k_bandHeight) {
++    KDCoordinate h = k_height - y < k_bandHeight ? k_height - y : k_bandHeight;
++    drawBand(ctx, y, h);
++  }
++}
++
++static void drawLockScreen(BandContext* ctx, const Controller* c) {
++  for (KDCoordinate y = ctx->top(); y <= ctx->bottom(); y++) {
++    KDColor* r = ctx->row(y);
++    for (int x = 0; x < k_width; x++) {
++      r[x] = x < 100 ? k_lockPanel : k_lockBackground;
++    }
+   }
+-  // Handle keys from 0 to 9
+-  const char* eventTextPtr = event.text();
+-  if (eventTextPtr != nullptr && eventTextPtr[0] != 0 && eventTextPtr[1] == 0 &&
+-      eventTextPtr[0] >= '0' && eventTextPtr[0] <= '9') {
+-    int iconIndex;
+-    if (eventTextPtr[0] == '0') {
+-      // Settings app is the last visible builtin app
+-      iconIndex = numberOfIcons() - 1 -
+-                  AppsContainer::sharedAppsContainer()->numberOfExternalApps();
++  // Left panel: the games, like the news column of the Switch lock screen
++  drawText(ctx, "Jeux", 50, 16, KDFont::Size::Small, KDWhite, Align::Center);
++  for (int i = 0; i < 3; i++) {
++    int y = 32 + i * 66;
++    if (i < c->numberOfGames()) {
++      drawGameTile(ctx, 20, y, 60, c->externalApp(c->gameAppIndex(i)), 256);
+     } else {
+-      iconIndex = eventTextPtr[0] - '1';
++      fillRect(ctx, 20, y, 60, 60, k_lockSlot);
+     }
+-    if (iconIndex >= AppsContainer::sharedAppsContainer()->numberOfApps()) {
+-      return false;
++  }
++  drawBattery(ctx, KDWhite);
++  constexpr int centerX = 210;
++  blendMask(ctx, SwitchIcons::k_house, SwitchIcons::k_houseSize, centerX, 100,
++            KDWhite);
++  drawText(ctx, "Menu HOME", centerX, 136, KDFont::Size::Small, KDWhite,
++           Align::Center);
++  // "(A) Continuer", gently pulsing
++  int opacity = 170 + static_cast<int>(86 * c->pulse());
++  KDSize textSize = KDFont::Font(KDFont::Size::Large)->stringSize("Continuer");
++  int total = SwitchIcons::k_a_button_bigSize + 6 + textSize.width();
++  int x = centerX - total / 2;
++  blendMask(ctx, SwitchIcons::k_a_button_big, SwitchIcons::k_a_button_bigSize,
++            x + SwitchIcons::k_a_button_bigSize / 2, 206, KDWhite, opacity);
++  drawText(ctx, "Continuer", x + SwitchIcons::k_a_button_bigSize + 6, 206,
++           KDFont::Size::Large, KDWhite, Align::Left, opacity);
++}
++
++void Controller::ContentView::drawBand(KDContext* screen, KDCoordinate y0,
++                                       KDCoordinate height) const {
++  BandContext ctx(y0, height);
++  const Controller* c = m_controller;
++  if (c->locked()) {
++    drawLockScreen(&ctx, c);
++    screen->fillRectWithPixels(KDRect(0, y0, k_width, height), s_band, nullptr);
++    return;
++  }
++  for (KDCoordinate y = y0; y < y0 + height; y++) {
++    KDColor* r = ctx.row(y);
++    for (int x = 0; x < k_width; x++) {
++      r[x] = k_background;
+     }
+-    int col = columnOfIconAtIndex(iconIndex);
+-    int row = rowOfIconAtIndex(iconIndex);
+-    if (col == m_view.selectableTableView()->selectedColumn() &&
+-        row == m_view.selectableTableView()->selectedRow()) {
+-      // We were already on the selected app
+-      switchToSelectedApp();
+-      return true;
++  }
++  int intro = c->introOpacity();
++  float focus = c->focus();
++  float pulse = c->pulse();
++  KDColor selection = mix(k_cyanLight, k_cyan, pulse);
++
++  // Top bar: players and battery
++  const uint32_t avatarColors[] = {0xE60012, 0x0AB9E6, 0x2EB82E};
++  for (int i = 0; i < 3; i++) {
++    int cx = 20 + i * 26;
++    blendMask(&ctx, SwitchIcons::k_avatar_disc, SwitchIcons::k_avatar_discSize,
++              cx, k_topBarY, KDColor::RGB24(avatarColors[i]), 256);
++    blendMask(&ctx, SwitchIcons::k_avatar, SwitchIcons::k_avatarSize, cx,
++              k_topBarY + 1, KDWhite, 230);
++  }
++  drawBattery(&ctx, k_ink);
++
++  // Games row: large tiles, the selected one framed in cyan
++  float scroll = c->tileScroll();
++  int games = c->numberOfGames();
++  int slots = games > k_visibleTiles + 1 ? games : k_visibleTiles + 1;
++  int firstSlot = static_cast<int>(scroll) - 1;
++  for (int i = firstSlot; i <= firstSlot + k_visibleTiles + 2; i++) {
++    if (i < 0 || i >= slots) {
++      continue;
++    }
++    int x = k_firstTileX +
++            static_cast<int>(roundf((i - scroll) * k_tileStep));
++    if (x + k_tileSize < 0 || x >= k_width) {
++      continue;
++    }
++    if (i < games) {
++      drawGameTile(&ctx, x, k_tileY, k_tileSize,
++                   c->externalApp(c->gameAppIndex(i)), intro);
++    } else {
++      fillRect(&ctx, x, k_tileY, k_tileSize, k_tileSize, k_emptyTile, intro);
++      strokeAround(&ctx, x + 1, k_tileY + 1, k_tileSize - 2, k_tileSize - 2, 1,
++                   k_emptyTileBorder, intro);
++    }
++    if (games > 0 && i == c->selectedGame() && focus < 1.f) {
++      int opacity = static_cast<int>(256 * (1.f - focus)) * intro >> 8;
++      strokeAround(&ctx, x, k_tileY, k_tileSize, k_tileSize, 2, KDWhite,
++                   opacity);
++      strokeAround(&ctx, x - 2, k_tileY - 2, k_tileSize + 4, k_tileSize + 4,
++                   3, selection, opacity);
++      // Title of the selected game, above its tile
++      drawText(&ctx, c->appLabel(c->gameAppIndex(i)), x, k_tileY - 13,
++               KDFont::Size::Small, k_cyanText, Align::Left, opacity);
+     }
+-    m_view.selectableTableView()->selectCellAtLocation(col, row);
+-    return true;
+   }
+-  // Handle Down when less than 3 icons at last row
+-  if (event == Ion::Events::Down &&
+-      selectionDataSource()->selectedRow() == numberOfRows() - 2) {
+-    // Otherwise would have been handled by SelectableTableView
+-    assert(selectionDataSource()->selectedColumn() > columnOfLastIcon());
+-    m_view.selectableTableView()->selectCellAtLocation(columnOfLastIcon(),
+-                                                       numberOfRows() - 1);
+-    return true;
++  if (games == 0) {
++    drawText(&ctx, "Ajoute des jeux .nwa avec l'installateur", 160,
++             k_tileY + k_tileSize + 10, KDFont::Size::Small, k_inkLight,
++             Align::Center, intro);
+   }
+-  return false;
+-}
+ 
+-void Controller::handleResponderChainEvent(ResponderChainEvent event) {
+-  if (event.type == ResponderChainEventType::HasBecomeFirst) {
+-    if (selectionDataSource()->selectedRow() == -1) {
+-      selectionDataSource()->selectCellAtLocation(0, 0);
++  // Apps row: round buttons, scrolling only when the selection needs it
++  float buttons = c->buttonScroll();
++  for (int i = 0; i < c->numberOfApps(); i++) {
++    int cx = k_firstButtonX +
++             static_cast<int>(roundf((i - buttons) * k_buttonStep));
++    if (cx < -30 || cx > k_width + 30) {
++      continue;
+     }
+-    App::app()->setFirstResponder(m_view.selectableTableView());
+-  } else {
+-    ViewController::handleResponderChainEvent(event);
++    if (k_buttonY + 26 < y0 || k_buttonY - 26 > y0 + height) {
++      break;
++    }
++    const AppItem& item = c->appAt(i);
++    bool selected = i == c->selectedApp();
++    float grow = selected ? focus : 0.f;
++    blendMask(&ctx, SwitchIcons::k_shadow, SwitchIcons::k_shadowSize, cx,
++              k_buttonY + 1, KDBlack, intro);
++    if (grow > 0.5f) {
++      blendMask(&ctx, SwitchIcons::k_ring, SwitchIcons::k_ringSize, cx,
++                k_buttonY, selection,
++                static_cast<int>(256 * focus) * intro >> 8);
++      blendMask(&ctx, SwitchIcons::k_button_big, SwitchIcons::k_button_bigSize,
++                cx, k_buttonY, KDWhite, intro);
++      blendMask(&ctx, SwitchIcons::k_glyphBig[item.icon],
++                SwitchIcons::k_glyphBigSize, cx, k_buttonY,
++                KDColor::RGB24(item.color), intro);
++    } else {
++      blendMask(&ctx, SwitchIcons::k_button, SwitchIcons::k_buttonSize, cx,
++                k_buttonY, KDWhite, intro);
++      blendMask(&ctx, SwitchIcons::k_glyph[item.icon], SwitchIcons::k_glyphSize,
++                cx, k_buttonY, KDColor::RGB24(item.color), intro);
++    }
++  }
++  if (focus > 0.f && c->numberOfApps() > 0) {
++    const AppItem& item = c->appAt(c->selectedApp());
++    int opacity = static_cast<int>(256 * focus) * intro >> 8;
++    int labelX = k_firstButtonX + static_cast<int>(roundf(
++                                     (c->selectedApp() - buttons) * k_buttonStep));
++    drawText(&ctx, c->appLabel(item.appIndex), labelX, k_buttonY + 28,
++             KDFont::Size::Small, k_cyanText, Align::Center, opacity);
+   }
++
++  // Bottom bar
++  fillRect(&ctx, 10, k_bottomLineY, k_width - 20, 1, k_ink);
++  blendMask(&ctx, SwitchIcons::k_console, SwitchIcons::k_consoleSize, 24,
++            k_bottomBarY, k_ink);
++  blendMask(&ctx, SwitchIcons::k_a_button, SwitchIcons::k_a_buttonSize, 280,
++            k_bottomBarY, k_ink);
++  drawText(&ctx, "OK", 290, k_bottomBarY, KDFont::Size::Small, k_ink);
++
++  screen->fillRectWithPixels(KDRect(0, y0, k_width, height), s_band, nullptr);
+ }
+ 
+-HighlightCell* Controller::reusableCell(int index) {
+-  assert(0 <= index && index < reusableCellCount());
+-  return &m_reusableCells[index];
++/* ------------------------------------------------------------ controller */
++
++Controller::Controller(Responder* parentResponder,
++                       SelectableTableViewDataSource* selectionDataSource)
++    : ViewController(parentResponder),
++      m_view(this),
++      m_numberOfApps(0),
++      m_numberOfGames(0),
++      m_game(s_game),
++      m_app(s_app),
++      m_row(s_row),
++      m_locked(false),
++      m_tileScroll(0.f),
++      m_buttonScroll(0.f),
++      m_focus(0.f),
++      m_introStart(0) {
++  buildMenu();
++  snapAnimations();
+ }
+ 
+-void Controller::fillCellForLocation(HighlightCell* cell, int column, int row) {
+-  AppCell* appCell = static_cast<AppCell*>(cell);
++void Controller::buildMenu() {
+   AppsContainer* container = AppsContainer::sharedAppsContainer();
+-  int appIdx = indexOfAppAtColumnAndRow(column, row);
+-  if (appIdx >= container->numberOfApps()) {
+-    appCell->setVisible(false);
+-  } else {
+-    appCell->setVisible(true);
+-    if (appIdx < container->numberOfBuiltinApps()) {
+-      const ::App::Descriptor* descriptor =
++  int builtin = container->numberOfBuiltinApps();
++  m_numberOfApps = 0;
++  for (const AppPlacement& p : k_placements) {
++    for (int appIdx = 1; appIdx < builtin; appIdx++) {
++      const ::App::Descriptor* d =
+           container->appSnapshotAtIndex(PermutedAppSnapshotIndex(appIdx))
+               ->descriptor();
+-      appCell->setBuiltinAppDescriptor(descriptor);
+-    } else {
+-      Ion::ExternalApps::App a = container->externalAppAtIndex(
+-          appIdx - container->numberOfBuiltinApps());
+-      appCell->setExternalApp(a);
++      if (d->name() == p.name && m_numberOfApps < k_maxApps) {
++        m_apps[m_numberOfApps++] = {static_cast<int16_t>(appIdx), p.icon,
++                                    p.color};
++      }
++    }
++  }
++  // Builtin apps we don't know about still get a button (before Settings)
++  for (int appIdx = 1; appIdx < builtin; appIdx++) {
++    const ::App::Descriptor* d =
++        container->appSnapshotAtIndex(PermutedAppSnapshotIndex(appIdx))
++            ->descriptor();
++    bool known = false;
++    for (const AppPlacement& p : k_placements) {
++      known = known || d->name() == p.name;
++    }
++    if (!known && m_numberOfApps < k_maxApps) {
++      m_apps[m_numberOfApps++] = {static_cast<int16_t>(appIdx), IconCode,
++                                  0x6E6E6E};
+     }
+   }
++  // External apps are the games
++  m_numberOfGames = 0;
++  int total = container->numberOfApps();
++  for (int appIdx = builtin; appIdx < total && m_numberOfGames < k_maxGames;
++       appIdx++) {
++    m_games[m_numberOfGames++] = static_cast<int16_t>(appIdx);
++  }
++  if (m_game >= m_numberOfGames) {
++    m_game = m_numberOfGames > 0 ? m_numberOfGames - 1 : 0;
++  }
++  if (m_app >= m_numberOfApps) {
++    m_app = m_numberOfApps > 0 ? m_numberOfApps - 1 : 0;
++  }
++  if (m_numberOfGames == 0) {
++    m_row = Row::Apps;
++  }
++}
++
++void Controller::reloadAppCells() {
++  buildMenu();
++  m_view.reload();
+ }
+ 
+-int Controller::numberOfIcons() const {
++const char* Controller::appLabel(int appIndex) const {
+   AppsContainer* container = AppsContainer::sharedAppsContainer();
+-  assert(container->numberOfApps() > 0);
+-  return container->numberOfApps() - 1;
++  int builtin = container->numberOfBuiltinApps();
++  if (appIndex < builtin) {
++    return I18n::translate(
++        container->appSnapshotAtIndex(PermutedAppSnapshotIndex(appIndex))
++            ->descriptor()
++            ->name());
++  }
++  const char* name = externalApp(appIndex).name();
++  return name ? name : "?";
++}
++
++Ion::ExternalApps::App Controller::externalApp(int appIndex) const {
++  AppsContainer* container = AppsContainer::sharedAppsContainer();
++  return container->externalAppAtIndex(appIndex -
++                                       container->numberOfBuiltinApps());
++}
++
++/* ------------------------------------------------------------ animations */
++
++float Controller::tileScrollTarget() const {
++  int target = m_game - (k_visibleTiles - 1);
++  return target > 0 ? static_cast<float>(target) : 0.f;
++}
++
++float Controller::buttonScrollTarget() const {
++  int target = m_app - k_visibleButtons / 2;
++  int max = m_numberOfApps - k_visibleButtons;
++  if (target > max) target = max;
++  return target > 0 ? static_cast<float>(target) : 0.f;
++}
++
++void Controller::snapAnimations() {
++  m_tileScroll = tileScrollTarget();
++  m_buttonScroll = buttonScrollTarget();
++  m_focus = m_row == Row::Apps ? 1.f : 0.f;
++}
++
++int Controller::introOpacity() const {
++  if (snapForTests()) {
++    return 256;
++  }
++  uint64_t elapsed = Ion::Timing::millis() - m_introStart;
++  if (elapsed >= k_introDuration) {
++    return 256;
++  }
++  float p = static_cast<float>(elapsed) / k_introDuration;
++  float q = 1.f - p;
++  return static_cast<int>(256 * (1.f - q * q * q));
++}
++
++float Controller::pulse() const {
++  float t = (Ion::Timing::millis() % 1800) / 1800.f;
++  return 0.5f + 0.5f * sinf(t * 6.2831853f);
++}
++
++static bool approach(float* value, float target) {
++  float d = target - *value;
++  if (d > 0.003f || d < -0.003f) {
++    *value += d * 0.34f;
++    return true;
++  }
++  *value = target;
++  return false;
++}
++
++bool Controller::animationFrame() {
++  if (m_locked) {
++    // Only "(A) Continuer" pulses
++    m_view.reloadRows(194, 218);
++    return true;
++  }
++  bool moving = approach(&m_tileScroll, tileScrollTarget());
++  moving = approach(&m_buttonScroll, buttonScrollTarget()) || moving;
++  moving = approach(&m_focus, m_row == Row::Apps ? 1.f : 0.f) || moving;
++  bool intro = Ion::Timing::millis() - m_introStart < k_introDuration + 40;
++  if (moving || intro) {
++    m_view.reload();
++    return true;
++  }
++  // Pulse of the selection frame / ring
++  if (m_row == Row::Games && m_numberOfGames > 0) {
++    m_view.reloadRows(k_tileY - 6, k_tileY + k_tileSize + 6);
++  } else {
++    m_view.reloadRows(k_buttonY - 24, k_buttonY + 24);
++  }
++  return true;
++}
++
++/* ---------------------------------------------------------------- events */
++
++void Controller::move(int delta) {
++  if (m_row == Row::Games) {
++    int next = m_game + delta;
++    if (next >= 0 && next < m_numberOfGames) {
++      m_game = next;
++    }
++  } else {
++    int next = m_app + delta;
++    if (next >= 0 && next < m_numberOfApps) {
++      m_app = next;
++    }
++  }
++  s_game = m_game;
++  s_app = m_app;
++  if (snapForTests()) {
++    snapAnimations();
++  }
++  m_view.reload();
+ }
+ 
+-void Controller::tableViewDidChangeSelectionAndDidScroll(
+-    SelectableTableView* t, int previousSelectedCol, int previousSelectedRow,
+-    KDPoint previousOffset, bool withinTemporarySelection) {
+-  assert(t == m_view.selectableTableView());
+-  /* If the number of icons is != 3*n, when we display the lowest row, no icons
+-   * are redrawn on the last cells, so the cells are not cleaned. We need to
+-   * redraw a white rect on these cells to hide the leftover icons. Ideally, we
+-   * would have redrawn all the background in white and then redraw visible
+-   * cells. However, the redrawing takes time and is visible at scrolling. Here,
+-   * we avoid the background complete redrawing but the code is a bit clumsy. */
+-  if (!withinTemporarySelection && t->selectedRow() == numberOfRows() - 1) {
+-    m_view.reloadBottomRow(this, columnOfLastIcon());
++void Controller::setRow(Row row) {
++  if (row == Row::Games && m_numberOfGames == 0) {
++    return;
++  }
++  m_row = row;
++  s_row = row;
++  if (snapForTests()) {
++    snapAnimations();
++  }
++  m_view.reload();
++}
++
++bool Controller::handleEvent(Ion::Events::Event event) {
++  if (m_locked) {
++    if (event == Ion::Events::OK || event == Ion::Events::EXE) {
++      m_locked = false;
++      m_introStart = Ion::Timing::millis();
++      m_view.reload();
++      return true;
++    }
++    // Swallow the other keys, but leave On/Off and system events alone
++    return event.isKeyboardEvent() && event != Ion::Events::OnOff;
++  }
++  if (event == Ion::Events::OK || event == Ion::Events::EXE) {
++    switchToSelectedApp();
++    return true;
++  }
++  if (event == Ion::Events::Left) {
++    move(-1);
++    return true;
++  }
++  if (event == Ion::Events::Right) {
++    move(1);
++    return true;
++  }
++  if (event == Ion::Events::Up) {
++    setRow(Row::Games);
++    return true;
++  }
++  if (event == Ion::Events::Down) {
++    setRow(Row::Apps);
++    return true;
++  }
++  if (event == Ion::Events::Home || event == Ion::Events::Back) {
++    return true;
++  }
++  return false;
++}
++
++void Controller::handleResponderChainEvent(ResponderChainEvent event) {
++  if (event.type == ResponderChainEventType::HasBecomeFirst) {
++    buildMenu();
++    if (!s_lockScreenShown) {
++      // HOME Menu / Continue screen, once at boot like the Switch
++      s_lockScreenShown = true;
++      m_locked = true;
++    }
++    snapAnimations();
++    m_introStart = Ion::Timing::millis();
++    m_view.reload();
++  } else {
++    ViewController::handleResponderChainEvent(event);
+   }
+ }
+ 
+@@ -184,22 +782,24 @@ SelectableTableViewDataSource* Controller::selectionDataSource() const {
+ 
+ void Controller::switchToSelectedApp() {
+   AppsContainer* container = AppsContainer::sharedAppsContainer();
+-  int appIdx = indexOfAppAtColumnAndRow(selectionDataSource()->selectedColumn(),
+-                                        selectionDataSource()->selectedRow());
+-  if (appIdx < container->numberOfBuiltinApps()) {
+-    ::App::Snapshot* selectedSnapshot =
+-        container->appSnapshotAtIndex(PermutedAppSnapshotIndex(appIdx));
+-    if (appIsForbidden(selectedSnapshot->descriptor()->name())) {
+-      App::app()->displayWarning(forbiddenAppMessage());
+-    } else {
+-      container->switchToBuiltinApp(selectedSnapshot);
++  if (m_row == Row::Games) {
++    if (m_numberOfGames == 0) {
++      return;
+     }
+-  } else {
+     assert(ExamModeManager::ExamMode().ruleset() == ExamMode::Ruleset::Off);
+     m_view.reload();
+-    Ion::ExternalApps::App a = container->externalAppAtIndex(
+-        appIdx - container->numberOfBuiltinApps());
+-    container->switchToExternalApp(a);
++    container->switchToExternalApp(externalApp(m_games[m_game]));
++    return;
++  }
++  if (m_numberOfApps == 0) {
++    return;
++  }
++  ::App::Snapshot* selectedSnapshot = container->appSnapshotAtIndex(
++      PermutedAppSnapshotIndex(m_apps[m_app].appIndex));
++  if (appIsForbidden(selectedSnapshot->descriptor()->name())) {
++    App::app()->displayWarning(forbiddenAppMessage());
++  } else {
++    container->switchToBuiltinApp(selectedSnapshot);
+   }
+ }
+ 
+diff --git a/epsilon/apps/home/controller.h b/epsilon/apps/home/controller.h
+index 7e1e98eb57..efea2c74c5 100644
+--- a/epsilon/apps/home/controller.h
++++ b/epsilon/apps/home/controller.h
+@@ -1,102 +1,106 @@
+ #pragma once
+ 
+-#include <escher/regular_table_view_data_source.h>
+-#include <escher/selectable_table_view.h>
++#include <escher/app.h>
+ #include <escher/selectable_table_view_data_source.h>
+-#include <escher/selectable_table_view_delegate.h>
+-#include <escher/theme/color_picker.h>
+ #include <escher/view_controller.h>
++#include <ion/external_apps.h>
+ 
+ #include "app_cell.h"
+ 
+ namespace Home {
+ 
+-class Controller : public Escher::ViewController,
+-                   public Escher::SimpleTableViewDataSource,
+-                   public Escher::SelectableTableViewDelegate {
++/* Switch-OS home screen, in the style of the Nintendo Switch HOME menu:
++ * games (external apps) as large tiles in the middle, builtin apps as round
++ * buttons at the bottom. At boot, a "HOME Menu / Continue" lock screen. */
++class Controller : public Escher::ViewController {
+  public:
+   Controller(Escher::Responder* parentResponder,
+              Escher::SelectableTableViewDataSource* selectionDataSource);
+ 
+   Escher::View* view() override { return &m_view; }
+-
+   bool handleEvent(Ion::Events::Event event) override;
++  void reloadAppCells();
++
++  constexpr static int k_maxApps = 24;
++  constexpr static int k_maxGames = 32;
++
++  struct AppItem {
++    int16_t appIndex;  // index in AppsContainer
++    uint8_t icon;      // index in SwitchIcons::k_glyph*
++    uint32_t color;    // glyph colour (0xRRGGBB)
++  };
++
++  // Rows
++  enum class Row : uint8_t { Games = 0, Apps = 1 };
+ 
+-  int numberOfRows() const override {
+-    return ((numberOfIcons() - 1) / k_numberOfColumns) + 1;
+-  }
+-  int numberOfColumns() const override { return k_numberOfColumns; }
+-  Escher::HighlightCell* reusableCell(int index) override;
+-  int reusableCellCount() const override { return k_numberOfReusableCells; }
+-  void fillCellForLocation(Escher::HighlightCell* cell, int column,
+-                           int row) override;
+-  bool canSelectCellAtLocation(int column, int row) override {
+-    assert(column >= 0 && column < numberOfColumns() && row >= 0 &&
+-           row < numberOfRows());
+-    return row < numberOfRows() - 1 || column <= columnOfLastIcon();
+-  }
+-  void tableViewDidChangeSelectionAndDidScroll(
+-      Escher::SelectableTableView* t, int previousSelectedCol,
+-      int previousSelectedRow, KDPoint previousOffset,
+-      bool withinTemporarySelection) override;
++  int numberOfGames() const { return m_numberOfGames; }
++  int numberOfApps() const { return m_numberOfApps; }
++  const AppItem& appAt(int i) const { return m_apps[i]; }
++  int gameAppIndex(int i) const { return m_games[i]; }
++  int selectedGame() const { return m_game; }
++  int selectedApp() const { return m_app; }
++  Row row() const { return m_row; }
++  bool locked() const { return m_locked; }
++  const char* appLabel(int appIndex) const;
++  Ion::ExternalApps::App externalApp(int appIndex) const;
++
++  // Animations (driven by Home::App::animationFrame)
++  constexpr static int k_animationPeriod = 40;  // ms, 25 fps
++  bool animationFrame();
++  float tileScroll() const { return m_tileScroll; }      // in tiles
++  float buttonScroll() const { return m_buttonScroll; }  // in buttons
++  float focus() const { return m_focus; }  // 0 = games row, 1 = apps row
++  int introOpacity() const;                // 0 -> 256
++  float pulse() const;                     // 0..1 selection glow
+ 
+  protected:
+   void handleResponderChainEvent(ResponderChainEvent event) override;
+ 
+  private:
+-  // SimpleTableViewDataSource
+-  KDCoordinate defaultRowHeight() override { return k_cellHeight; }
+-  KDCoordinate defaultColumnWidth() override { return k_cellWidth; }
++  class ContentView : public Escher::View {
++   public:
++    ContentView(Controller* controller) : m_controller(controller) {}
++    void drawRect(KDContext* ctx, KDRect rect) const override;
++    void reload() { markWholeFrameAsDirty(); }
++    void reloadRows(int top, int bottom) {
++      if (top < 0) top = 0;
++      if (bottom > Ion::Display::Height - 1) bottom = Ion::Display::Height - 1;
++      if (bottom >= top) {
++        markRectAsDirty(KDRect(0, top, Ion::Display::Width, bottom - top + 1));
++      }
++    }
+ 
+-  int numberOfIcons() const;
++   private:
++    void drawBand(KDContext* ctx, KDCoordinate y0, KDCoordinate height) const;
++    Controller* m_controller;
++  };
++
++  void buildMenu();
++  void move(int delta);
++  void setRow(Row row);
++  float tileScrollTarget() const;
++  float buttonScrollTarget() const;
++  void snapAnimations();
+   Escher::SelectableTableViewDataSource* selectionDataSource() const;
+   void switchToSelectedApp();
+   bool appIsForbidden(I18n::Message appName) const;
+   I18n::Message forbiddenAppMessage() const;
+ 
+-  // Conversion index <--> column/row
+-  int columnOfIconAtIndex(int iconIndex) const {
+-    return iconIndex % k_numberOfColumns;
+-  }
+-  int rowOfIconAtIndex(int iconIndex) const {
+-    return iconIndex / k_numberOfColumns;
+-  }
+-  int indexOfIconAtColumnAndRow(int column, int row) const {
+-    return row * k_numberOfColumns + column;
+-  }
+-  int indexOfAppAtColumnAndRow(int column, int row) const {
+-    return indexOfIconAtColumnAndRow(column, row) + 1;
+-  }
+-  int columnOfLastIcon() { return columnOfIconAtIndex(numberOfIcons() - 1); }
+-
+-  class ContentView : public Escher::View {
+-   public:
+-    ContentView(Controller* controller,
+-                Escher::SelectableTableViewDataSource* selectionDataSource);
+-    Escher::SelectableTableView* selectableTableView();
+-    void drawRect(KDContext* ctx, KDRect rect) const override {
+-      ctx->fillRect(bounds(), Escher::ColorPicker::Resolve(
+-                                  Escher::ThemeComponent::DefaultBackground));
+-    }
+-    void reload() { markWholeFrameAsDirty(); }
+-    void reloadBottomRow(SimpleTableViewDataSource* dataSource,
+-                         int lastIconColumn);
++  constexpr static uint64_t k_introDuration = 320;  // ms
+ 
+-   private:
+-    int numberOfSubviews() const override { return 1; }
+-    View* subviewAtIndex(int index) override;
+-    void layoutSubviews(bool force = false) override;
+-    Escher::SelectableTableView m_selectableTableView;
+-  };
+-  constexpr static KDMargins k_margins = {4, 4, 0, 0};
+-  constexpr static KDCoordinate k_bottomMargin = 14;
+-  constexpr static KDCoordinate k_indicatorMargin = 61;
+-  constexpr static int k_numberOfColumns = 3;
+-  constexpr static int k_numberOfReusableCells = 6;
+-  constexpr static int k_cellHeight = 104;
+-  constexpr static int k_cellWidth = 104;
+   ContentView m_view;
+-  AppCell m_reusableCells[k_numberOfReusableCells];
++  AppItem m_apps[k_maxApps];
++  int16_t m_games[k_maxGames];
++  int m_numberOfApps;
++  int m_numberOfGames;
++  int m_game;
++  int m_app;
++  Row m_row;
++  bool m_locked;
++  float m_tileScroll;
++  float m_buttonScroll;
++  float m_focus;
++  uint64_t m_introStart;
+ };
+ 
+ }  // namespace Home
+diff --git a/epsilon/apps/home/psp/gen_icons.py b/epsilon/apps/home/psp/gen_icons.py
+new file mode 100644
+index 0000000000..3ff5ec623f
+--- /dev/null
++++ b/epsilon/apps/home/psp/gen_icons.py
+@@ -0,0 +1,398 @@
++#!/usr/bin/env python3
++"""Generate the PSP-style (XMB) white glyph icons for the PSP-OS home screen.
++
++Every icon is drawn as vector shapes in a 100x100 design space, rendered with
++8x supersampling, then exported as 8-bit alpha masks (A8) in a C++ header.
++For each icon two masks are produced:
++  - a "small" mask (unselected state)
++  - a "big" mask with a soft glow halo baked in (selected state)
++
++Usage: gen_icons.py <output_header.h> [--preview preview.png]
++"""
++
++import math
++import sys
++
++from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
++
++SS = 8  # supersampling factor
++D = 100  # design space size
++
++FONT_PATHS = [
++    "/System/Library/Fonts/Helvetica.ttc",
++    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
++    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
++]
++
++
++def font(size):
++    for p in FONT_PATHS:
++        try:
++            return ImageFont.truetype(p, size, index=1) if p.endswith(".ttc") else ImageFont.truetype(p, size)
++        except Exception:
++            continue
++    return ImageFont.load_default()
++
++
++class Canvas:
++    """Draw in 100x100 design units on a supersampled L image."""
++
++    def __init__(self):
++        self.n = D * SS
++        self.img = Image.new("L", (self.n, self.n), 0)
++        self.d = ImageDraw.Draw(self.img)
++
++    def s(self, v):
++        return v * SS
++
++    def box(self, x0, y0, x1, y1):
++        return [self.s(x0), self.s(y0), self.s(x1), self.s(y1)]
++
++    def rrect(self, x0, y0, x1, y1, r, fill=255, outline=None, width=0):
++        self.d.rounded_rectangle(self.box(x0, y0, x1, y1), radius=self.s(r), fill=fill,
++                                 outline=outline, width=int(round(self.s(width))) if width else 0)
++
++    def rect(self, x0, y0, x1, y1, fill=255):
++        self.d.rectangle(self.box(x0, y0, x1, y1), fill=fill)
++
++    def ellipse(self, x0, y0, x1, y1, fill=255, outline=None, width=0):
++        self.d.ellipse(self.box(x0, y0, x1, y1), fill=fill, outline=outline,
++                       width=int(round(self.s(width))) if width else 0)
++
++    def circle(self, cx, cy, r, fill=255, outline=None, width=0):
++        self.ellipse(cx - r, cy - r, cx + r, cy + r, fill=fill, outline=outline, width=width)
++
++    def line(self, pts, width, fill=255, joint="curve"):
++        self.d.line([(self.s(x), self.s(y)) for x, y in pts], fill=fill, width=int(round(self.s(width))), joint=joint)
++        # round caps
++        for x, y in (pts[0], pts[-1]):
++            self.circle(x, y, width / 2, fill=fill)
++
++    def poly(self, pts, fill=255):
++        self.d.polygon([(self.s(x), self.s(y)) for x, y in pts], fill=fill)
++
++    def text(self, cx, cy, txt, size, fill=255):
++        f = font(self.s(size))
++        bb = self.d.textbbox((0, 0), txt, font=f)
++        w, h = bb[2] - bb[0], bb[3] - bb[1]
++        self.d.text((self.s(cx) - w / 2 - bb[0], self.s(cy) - h / 2 - bb[1]), txt, font=f, fill=fill)
++
++    def arc(self, x0, y0, x1, y1, start, end, width, fill=255):
++        self.d.arc(self.box(x0, y0, x1, y1), start, end, fill=fill, width=int(round(self.s(width))))
++
++    def paste_rotated(self, other, angle):
++        rot = other.img.rotate(angle, resample=Image.BICUBIC, center=(self.n / 2, self.n / 2))
++        self.img = ImageChops.lighter(self.img, rot)
++        self.d = ImageDraw.Draw(self.img)
++
++
++# ---------------------------------------------------------------- categories
++
++def cat_settings(c):
++    # Toolbox (PSP "Settings")
++    c.arc(34, 14, 66, 44, 180, 360, 7)
++    c.rect(34, 28, 41, 36)
++    c.rect(59, 28, 66, 36)
++    c.rrect(8, 32, 92, 88, 7)
++    c.rect(8, 52, 92, 56, fill=0)  # lid separation
++    c.rrect(43, 46, 57, 62, 3, fill=0)  # latch hole
++    c.rrect(46, 49, 54, 59, 2)  # latch
++
++
++def cat_calc(c):
++    # Calculator
++    c.rrect(20, 6, 80, 94, 9)
++    c.rrect(28, 14, 72, 34, 3, fill=0)
++    for row in range(4):
++        for col in range(3):
++            x = 29 + col * 15
++            y = 42 + row * 12.5
++            c.rrect(x, y, x + 12, y + 9, 2.5, fill=0)
++
++
++def cat_graph(c):
++    # Axes and a curve
++    c.line([(14, 8), (14, 86), (94, 86)], 7, joint="curve")
++    pts = []
++    for i in range(41):
++        x = 22 + i * 1.75
++        y = 52 - 30 * math.sin((x - 22) / 70 * 2 * math.pi)
++        pts.append((x, y))
++    c.line(pts, 7)
++
++
++def cat_stats(c):
++    # Bar chart
++    heights = [36, 62, 48, 80]
++    for i, h in enumerate(heights):
++        x = 10 + i * 21
++        c.rrect(x, 88 - h, x + 16, 88, 2.5)
++    c.rect(4, 90, 96, 95)
++
++
++def cat_extra(c):
++    # Atom
++    c.circle(50, 50, 9)
++    ring = Canvas()
++    ring.ellipse(8, 34, 92, 66, fill=None, outline=255, width=6)
++    for a in (0, 60, 120):
++        c.paste_rotated(ring, a)
++
++
++def cat_games(c):
++    # Game controller (PSP "Game")
++    c.rrect(12, 28, 88, 62, 17)
++    c.ellipse(4, 34, 40, 84)
++    c.ellipse(60, 34, 96, 84)
++    # d-pad
++    c.rect(18, 46, 36, 52, fill=0)
++    c.rect(24, 40, 30, 58, fill=0)
++    # buttons
++    c.circle(72, 41, 4.5, fill=0)
++    c.circle(72, 57, 4.5, fill=0)
++    c.circle(64, 49, 4.5, fill=0)
++    c.circle(80, 49, 4.5, fill=0)
++
++
++# --------------------------------------------------------------------- items
++
++def it_calculation(c):
++    c.rrect(8, 8, 92, 92, 14, fill=None, outline=255, width=6)
++    c.rect(48, 14, 52, 86)
++    c.rect(14, 48, 86, 52)
++    # + top-left
++    c.rect(22, 29, 40, 33)
++    c.rect(29, 22, 33, 40)
++    # - top-right
++    c.rect(60, 29, 78, 33)
++    # x bottom-left
++    c.line([(23, 61), (39, 77)], 4.5)
++    c.line([(39, 61), (23, 77)], 4.5)
++    # = bottom-right
++    c.rect(60, 63, 78, 67)
++    c.rect(60, 71, 78, 75)
++
++
++def it_solver(c):
++    c.text(32, 50, "x", 62)
++    c.rect(58, 38, 92, 45)
++    c.rect(58, 55, 92, 62)
++
++
++def it_finance(c):
++    c.circle(50, 50, 42, fill=None, outline=255, width=7)
++    c.text(51, 51, "€", 52)
++
++
++def it_graph(c):
++    c.line([(12, 8), (12, 88), (92, 88)], 6)
++    pts = [(20 + i * 1.8, 80 - 0.0105 * ((20 + i * 1.8) - 56) ** 2 * -1 - 62 + 0.0) for i in range(0)]
++    pts = []
++    for i in range(36):
++        x = 22 + i * 2
++        y = 18 + ((x - 57) / 35.0) ** 2 * 60
++        pts.append((x, y))
++    c.line(pts, 6)
++
++
++def it_sequence(c):
++    c.line([(10, 8), (10, 90), (94, 90)], 5)
++    for i in range(5):
++        x = 24 + i * 16
++        y = 78 - (i * i) * 3.6
++        c.circle(x, y, 6.5)
++
++
++def it_regression(c):
++    pts = [(20, 74), (30, 62), (40, 66), (52, 50), (62, 46), (72, 30), (82, 28)]
++    for x, y in pts:
++        c.circle(x, y, 5.5)
++    c.line([(10, 84), (92, 20)], 5)
++
++
++def it_statistics(c):
++    heights = [24, 46, 72, 56, 30]
++    for i, h in enumerate(heights):
++        x = 9 + i * 17
++        c.rect(x, 90 - h, x + 15, 90)
++
++
++def bell(c, filled, tails=False):
++    pts = []
++    for i in range(81):
++        x = 6 + i * 1.1
++        u = (x - 50) / 15.0
++        y = 86 - 70 * math.exp(-u * u / 2)
++        pts.append((x, y))
++    if filled:
++        c.poly(pts + [(94, 90), (6, 90)])
++    else:
++        c.line(pts, 6)
++        c.rect(4, 87, 96, 92)
++        if tails:
++            left = [p for p in pts if p[0] <= 26]
++            right = [p for p in pts if p[0] >= 74]
++            c.poly(left + [(26, 90), (6, 90)])
++            c.poly(right + [(94, 90), (74, 90)])
++
++
++def it_distributions(c):
++    bell(c, filled=True)
++
++
++def it_inference(c):
++    bell(c, filled=False, tails=True)
++
++
++def it_elements(c):
++    # periodic table silhouette
++    u = 11.5
++    cells = [(0, 0), (7, 0),
++             (0, 1), (1, 1), (5, 1), (6, 1), (7, 1),
++             (0, 2), (1, 2), (2, 2), (3, 2), (4, 2), (5, 2), (6, 2), (7, 2),
++             (0, 3), (1, 3), (2, 3), (3, 3), (4, 3), (5, 3), (6, 3), (7, 3)]
++    for (x, y) in cells:
++        x0 = 4 + x * u
++        y0 = 24 + y * u
++        c.rrect(x0, y0, x0 + u - 2.5, y0 + u - 2.5, 1.5)
++    for x in range(2, 7):
++        x0 = 4 + x * u
++        c.rrect(x0, 24 + 4.5 * u, x0 + u - 2.5, 24 + 5.5 * u - 2.5, 1.5)
++
++
++def it_code(c):
++    c.rrect(6, 14, 94, 86, 10, fill=None, outline=255, width=6)
++    c.line([(22, 36), (38, 50), (22, 64)], 7)
++    c.rect(46, 62, 76, 68)
++
++
++def it_settings(c):
++    # gear
++    cx, cy = 50, 50
++    teeth = 8
++    for i in range(teeth):
++        a = i * 2 * math.pi / teeth
++        dx, dy = math.cos(a), math.sin(a)
++        px, py = -dy, dx
++        w = 8
++        r0, r1 = 30, 44
++        c.poly([(cx + dx * r0 + px * w, cy + dy * r0 + py * w),
++                (cx + dx * r1 + px * (w - 2), cy + dy * r1 + py * (w - 2)),
++                (cx + dx * r1 - px * (w - 2), cy + dy * r1 - py * (w - 2)),
++                (cx + dx * r0 - px * w, cy + dy * r0 - py * w)])
++    c.circle(cx, cy, 34)
++    c.circle(cx, cy, 14, fill=0)
++
++
++def it_umd(c):
++    # UMD disc in its shell
++    c.rrect(10, 6, 90, 94, 30)
++    c.circle(50, 46, 31, fill=0)
++    c.circle(50, 46, 26)
++    c.circle(50, 46, 8, fill=0)
++    c.arc(30, 26, 70, 66, 200, 250, 3, fill=0)
++    c.rrect(36, 82, 64, 87, 2, fill=0)
++
++
++CATEGORIES = [
++    ("cat_settings", cat_settings),
++    ("cat_calc", cat_calc),
++    ("cat_graph", cat_graph),
++    ("cat_stats", cat_stats),
++    ("cat_extra", cat_extra),
++    ("cat_games", cat_games),
++]
++
++ITEMS = [
++    ("it_calculation", it_calculation),
++    ("it_solver", it_solver),
++    ("it_finance", it_finance),
++    ("it_graph", it_graph),
++    ("it_sequence", it_sequence),
++    ("it_regression", it_regression),
++    ("it_statistics", it_statistics),
++    ("it_distributions", it_distributions),
++    ("it_inference", it_inference),
++    ("it_elements", it_elements),
++    ("it_code", it_code),
++    ("it_settings", it_settings),
++    ("it_umd", it_umd),
++]
++
++CAT_SMALL, CAT_BIG = 26, 34
++ITEM_SMALL, ITEM_BIG = 22, 30
++GLOW = 7  # glow padding around big icons
++
++
++def render(fn, size):
++    c = Canvas()
++    fn(c)
++    return c.img.resize((size, size), Image.LANCZOS)
++
++
++def with_glow(icon, pad):
++    w = icon.width + 2 * pad
++    base = Image.new("L", (w, w), 0)
++    base.paste(icon, (pad, pad))
++    glow = base.filter(ImageFilter.GaussianBlur(pad / 2.2))
++    glow = glow.point(lambda v: min(255, int(v * 0.85)))
++    return ImageChops.lighter(base, glow)
++
++
++def c_array(name, img):
++    data = list(img.tobytes())
++    lines = []
++    for i in range(0, len(data), 24):
++        lines.append("  " + ", ".join(str(v) for v in data[i:i + 24]) + ",")
++    return f"constexpr uint8_t {name}[{len(data)}] = {{\n" + "\n".join(lines) + "\n};\n"
++
++
++def main():
++    out = sys.argv[1]
++    preview = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == "--preview" else None
++    parts = [
++        "// Generated by apps/home/psp/gen_icons.py - do not edit\n#pragma once\n#include <stdint.h>\n\nnamespace Home {\nnamespace PSPIcons {\n",
++        f"constexpr int k_catSmallSize = {CAT_SMALL};\nconstexpr int k_catBigSize = {CAT_BIG + 2 * GLOW};\n",
++        f"constexpr int k_itemSmallSize = {ITEM_SMALL};\nconstexpr int k_itemBigSize = {ITEM_BIG + 2 * GLOW};\n",
++        f"constexpr int k_glow = {GLOW};\n\n",
++    ]
++    previews = []
++    for name, fn in CATEGORIES:
++        small = render(fn, CAT_SMALL)
++        big = with_glow(render(fn, CAT_BIG), GLOW)
++        parts.append(c_array(name + "_small", small))
++        parts.append(c_array(name + "_big", big))
++        previews.append((small, big))
++    for name, fn in ITEMS:
++        small = render(fn, ITEM_SMALL)
++        big = with_glow(render(fn, ITEM_BIG), GLOW)
++        parts.append(c_array(name + "_small", small))
++        parts.append(c_array(name + "_big", big))
++        previews.append((small, big))
++
++    def table(prefix, entries, suffix):
++        return f"constexpr const uint8_t* {prefix}{suffix.capitalize()}[] = {{" + ", ".join(
++            n + "_" + suffix for n, _ in entries) + "};\n"
++
++    parts.append(table("k_cat", CATEGORIES, "small"))
++    parts.append(table("k_cat", CATEGORIES, "big"))
++    parts.append(table("k_item", ITEMS, "small"))
++    parts.append(table("k_item", ITEMS, "big"))
++    parts.append("\n}  // namespace PSPIcons\n}  // namespace Home\n")
++    with open(out, "w") as f:
++        f.write("".join(parts))
++
++    if preview:
++        cell = 60
++        sheet = Image.new("RGB", (cell * 2, cell * len(previews)), (40, 90, 180))
++        for i, (s, b) in enumerate(previews):
++            white = Image.new("RGB", s.size, (255, 255, 255))
++            sheet.paste(white, (5, i * cell + 5), s)
++            white = Image.new("RGB", b.size, (255, 255, 255))
++            sheet.paste(white, (cell + 5, i * cell + 5), b)
++        sheet = sheet.resize((sheet.width * 2, sheet.height * 2), Image.NEAREST)
++        sheet.save(preview)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/epsilon/apps/home/switch/gen_icons.py b/epsilon/apps/home/switch/gen_icons.py
+new file mode 100644
+index 0000000000..87e78ca0a6
+--- /dev/null
++++ b/epsilon/apps/home/switch/gen_icons.py
+@@ -0,0 +1,149 @@
++#!/usr/bin/env python3
++"""Generate the Switch-style alpha masks for the Switch-OS home screen.
++
++App glyphs are shared with PSP-OS (../psp/gen_icons.py) and rendered at two
++sizes (button / selected button). The Switch UI shapes (round buttons,
++selection ring, HOME house, A button, console, avatars) are drawn here.
++All masks are 8-bit alpha (A8), antialiased with 8x supersampling.
++
++Usage: gen_icons.py <output_header.h> [--preview preview.png]
++"""
++
++import importlib.util
++import math
++import sys
++from pathlib import Path
++
++from PIL import Image, ImageChops, ImageFilter
++
++HERE = Path(__file__).resolve().parent
++spec = importlib.util.spec_from_file_location("psp_icons", HERE.parent / "psp" / "gen_icons.py")
++psp = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(psp)
++Canvas = psp.Canvas
++
++GLYPH, GLYPH_BIG = 17, 21          # app glyph inside a round button
++BUTTON, BUTTON_BIG = 30, 36        # round button diameter
++RING = 44                          # cyan selection ring (outer diameter)
++SHADOW = 40                        # soft shadow under buttons
++
++
++def render(fn, size):
++    c = Canvas()
++    fn(c)
++    return c.img.resize((size, size), Image.LANCZOS)
++
++
++def disc(c):
++    c.circle(50, 50, 50)
++
++
++def ring(c):
++    # 3px ring at 44px -> thickness ~7 design units
++    c.circle(50, 50, 50)
++    c.circle(50, 50, 50 - 7.5, fill=0)
++
++
++def shadow_mask(size):
++    img = Image.new("L", (size, size), 0)
++    inner = render(disc, size - 10)
++    img.paste(inner, (5, 7))
++    return img.filter(ImageFilter.GaussianBlur(2.5)).point(lambda v: int(v * 0.35))
++
++
++def house(c):
++    # HOME icon of the lock screen: white circle outline with a house
++    c.circle(50, 50, 48, fill=None, outline=255, width=6)
++    c.poly([(50, 24), (78, 48), (71, 48), (71, 74), (29, 74), (29, 48), (22, 48)])
++    c.rect(44, 56, 56, 74, fill=0)
++
++
++def a_button(c):
++    c.circle(50, 50, 50)
++    c.text(50, 52, "A", 62, fill=0)
++
++
++def console(c):
++    # Handheld Switch: two joy-cons and the screen
++    c.rrect(4, 22, 96, 78, 12)
++    c.rrect(22, 30, 78, 70, 3, fill=0)
++    c.rect(18, 22, 20, 78, fill=0)
++    c.rect(80, 22, 82, 78, fill=0)
++    c.circle(11, 40, 3.5, fill=0)
++    c.circle(89, 60, 3.5, fill=0)
++
++
++def avatar(c):
++    # Simple player silhouette, drawn in white on a coloured disc
++    c.circle(50, 38, 16)
++    c.ellipse(22, 60, 78, 104)
++
++
++def wifi(c):
++    for r in (44, 30):
++        c.arc(50 - r, 80 - r, 50 + r, 80 + r, 225, 315, 9)
++    c.circle(50, 76, 7)
++
++
++SHAPES = [
++    ("button", disc, BUTTON),
++    ("button_big", disc, BUTTON_BIG),
++    ("ring", ring, RING),
++    ("house", house, 46),
++    ("a_button", a_button, 14),
++    ("a_button_big", a_button, 20),
++    ("console", console, 22),
++    ("avatar", avatar, 14),
++    ("avatar_disc", disc, 21),
++]
++
++
++def c_array(name, img):
++    data = list(img.tobytes())
++    lines = ["  " + ", ".join(str(v) for v in data[i:i + 24]) + ","
++             for i in range(0, len(data), 24)]
++    return f"constexpr uint8_t {name}[{len(data)}] = {{\n" + "\n".join(lines) + "\n};\n"
++
++
++def main():
++    out = sys.argv[1]
++    preview = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == "--preview" else None
++    parts = ["// Generated by apps/home/switch/gen_icons.py - do not edit\n#pragma once\n"
++             "#include <stdint.h>\n\nnamespace Home {\nnamespace SwitchIcons {\n\n",
++             f"constexpr int k_glyphSize = {GLYPH};\nconstexpr int k_glyphBigSize = {GLYPH_BIG};\n",
++             f"constexpr int k_shadowSize = {SHADOW};\n\n"]
++    previews = []
++    for name, fn, size in SHAPES:
++        img = render(fn, size)
++        parts.append(f"constexpr int k_{name}Size = {size};\n")
++        parts.append(c_array(f"k_{name}", img))
++        previews.append(img)
++    sh = shadow_mask(SHADOW)
++    parts.append(c_array("k_shadow", sh))
++    previews.append(sh)
++    for name, fn in psp.ITEMS:
++        small = render(fn, GLYPH)
++        big = render(fn, GLYPH_BIG)
++        parts.append(c_array(name + "_glyph", small))
++        parts.append(c_array(name + "_glyph_big", big))
++        previews += [small, big]
++    parts.append("constexpr const uint8_t* k_glyph[] = {" +
++                 ", ".join(n + "_glyph" for n, _ in psp.ITEMS) + "};\n")
++    parts.append("constexpr const uint8_t* k_glyphBig[] = {" +
++                 ", ".join(n + "_glyph_big" for n, _ in psp.ITEMS) + "};\n")
++    parts.append("\n}  // namespace SwitchIcons\n}  // namespace Home\n")
++    Path(out).write_text("".join(parts))
++
++    if preview:
++        cell = 52
++        cols = 8
++        rows = (len(previews) + cols - 1) // cols
++        sheet = Image.new("RGB", (cols * cell, rows * cell), (70, 70, 70))
++        for i, m in enumerate(previews):
++            white = Image.new("RGB", m.size, (255, 255, 255))
++            sheet.paste(white, ((i % cols) * cell + 4, (i // cols) * cell + 4), m)
++        sheet.resize((sheet.width * 2, sheet.height * 2), Image.NEAREST).save(preview)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/epsilon/apps/home/switch/switch_icons.h b/epsilon/apps/home/switch/switch_icons.h
+new file mode 100644
+index 0000000000..3b5bb90eba
+--- /dev/null
++++ b/epsilon/apps/home/switch/switch_icons.h
+@@ -0,0 +1,917 @@
++// Generated by apps/home/switch/gen_icons.py - do not edit
++#pragma once
++#include <stdint.h>
++
++namespace Home {
++namespace SwitchIcons {
++
++constexpr int k_glyphSize = 17;
++constexpr int k_glyphBigSize = 21;
++constexpr int k_shadowSize = 40;
++
++constexpr int k_buttonSize = 30;
++constexpr uint8_t k_button[900] = {
++  0, 0, 0, 0, 0, 0, 3, 0, 0, 14, 85, 158, 210, 239, 253, 253, 240, 211, 160, 88, 16, 0, 0, 3,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 20, 127, 221, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 224, 131, 23, 0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 91, 228, 255, 255, 254, 252,
++  253, 254, 255, 255, 254, 253, 252, 253, 255, 255, 232, 97, 0, 1, 1, 0, 0, 0, 0, 0, 1, 2, 0, 147,
++  255, 255, 251, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 251, 255, 255, 154, 3, 1, 1, 0, 0,
++  0, 1, 3, 0, 167, 255, 251, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 251,
++  255, 175, 3, 3, 1, 0, 0, 3, 0, 148, 255, 249, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 250, 255, 156, 0, 3, 0, 3, 0, 88, 255, 250, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 250, 255, 97, 0, 3, 1, 18, 234, 253, 253, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 253, 239, 22, 1,
++  0, 127, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 251, 255, 137, 0, 13, 226, 254, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 254, 254, 232, 17, 84, 255, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 255, 94, 160, 254, 252, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 254, 170,
++  212, 255, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 254, 255, 221, 240, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 248, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  241, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 249, 214, 255, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 222, 163, 254, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 254, 173, 87, 255, 253, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 255, 97,
++  14, 229, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 254, 254, 235, 19, 0, 131, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 141, 0, 1, 20, 237, 253, 253, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 253, 241, 25, 1, 3, 0, 94, 255, 250, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 250, 255, 103, 0, 3,
++  0, 3, 0, 155, 255, 249, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  250, 255, 163, 0, 3, 0, 0, 1, 3, 2, 175, 255, 251, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 254, 251, 255, 182, 5, 3, 1, 0, 0, 0, 1, 1, 3, 155, 255, 255, 251, 254, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 254, 251, 255, 255, 162, 6, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0,
++  100, 234, 255, 255, 253, 252, 254, 255, 255, 255, 255, 254, 253, 253, 255, 255, 237, 105, 0, 0, 1, 0, 0, 0,
++  0, 0, 0, 0, 1, 3, 0, 25, 136, 227, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 229, 140, 29, 0,
++  2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 20, 94, 168, 218, 246, 255, 255, 247, 220,
++  170, 97, 22, 0, 0, 3, 0, 0, 0, 0, 0, 0,
++};
++constexpr int k_button_bigSize = 36;
++constexpr uint8_t k_button_big[1296] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 46, 116, 177, 218, 242, 254, 254, 243, 219, 179, 119, 49,
++  0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 4, 90, 189,
++  248, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 249, 192, 95, 7, 0, 3, 1, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 2, 0, 0, 75, 207, 255, 255, 255, 252, 253, 254, 255, 255, 255, 255, 254, 253, 252, 255,
++  255, 255, 212, 81, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 7, 150, 255, 255, 252, 252,
++  254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 252, 255, 255, 157, 11, 0, 2, 0, 0, 0, 0,
++  0, 0, 0, 2, 0, 22, 197, 255, 252, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 253, 252, 255, 204, 28, 0, 2, 0, 0, 0, 0, 0, 2, 0, 21, 212, 255, 250, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 250, 255, 219, 27, 0, 2, 0, 0,
++  0, 1, 3, 7, 199, 255, 250, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 251, 255, 207, 11, 3, 1, 0, 0, 3, 0, 151, 255, 250, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 250, 255, 162, 0, 3, 0,
++  3, 0, 70, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 251, 255, 81, 0, 3, 2, 5, 214, 254, 252, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 254, 222, 9, 1,
++  0, 87, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 99, 0, 0, 193, 254, 252, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 254, 202, 2,
++  43, 249, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 252, 53, 117, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 129,
++  179, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 255, 190, 220, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 229,
++  243, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 244, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252,
++  221, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 231, 181, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 255, 193,
++  120, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 132, 46, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 253, 56,
++  1, 197, 254, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 252, 254, 206, 3, 0, 92, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 104, 0,
++  1, 7, 218, 254, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 253, 254, 226, 11, 1, 3, 0, 77, 255, 251, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 87, 0, 4,
++  0, 3, 0, 159, 255, 250, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 250, 255, 170, 0, 3, 0, 0, 1, 3, 10, 206, 255, 251, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 214, 14, 2, 1, 0,
++  0, 0, 2, 0, 27, 219, 255, 250, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 250, 255, 226, 33, 0, 2, 0, 0, 0, 0, 0, 2, 0, 28, 205, 255, 252, 253, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 251, 255, 212, 34, 0, 3, 0, 0, 0,
++  0, 0, 0, 0, 2, 0, 12, 160, 255, 255, 251, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  253, 251, 255, 255, 167, 16, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 85, 216, 255, 255,
++  255, 252, 253, 254, 255, 255, 255, 255, 254, 253, 252, 255, 255, 255, 220, 91, 0, 0, 2, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 1, 3, 0, 9, 100, 198, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253,
++  201, 105, 12, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0,
++  56, 128, 188, 228, 250, 255, 255, 251, 229, 191, 131, 59, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr int k_ringSize = 44;
++constexpr uint8_t k_ring[1936] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 23, 83, 144, 192, 225, 244, 254, 255, 245,
++  226, 195, 147, 87, 26, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 2, 2, 0, 1, 73, 166, 232, 255, 255, 255, 255, 254, 252, 252, 253, 255, 255, 255, 255,
++  235, 171, 78, 3, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  3, 0, 0, 85, 204, 255, 255, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 255, 255, 209,
++  92, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 39, 181, 255,
++  255, 250, 255, 255, 253, 212, 162, 121, 95, 79, 78, 94, 119, 159, 209, 252, 255, 255, 250, 255, 255, 189, 45, 0,
++  3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 92, 240, 255, 249, 255, 255, 214, 123,
++  44, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 41, 117, 210, 255, 255, 248, 255, 245, 101, 0, 2, 1, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 131, 255, 255, 250, 255, 217, 93, 7, 0, 0, 0, 3, 4,
++  4, 3, 3, 4, 4, 3, 0, 0, 0, 4, 87, 211, 255, 251, 254, 255, 142, 0, 3, 1, 0, 0, 0, 0,
++  0, 0, 0, 0, 4, 0, 147, 255, 249, 255, 255, 138, 12, 0, 0, 4, 2, 1, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 2, 4, 0, 0, 8, 130, 255, 255, 248, 255, 158, 0, 3, 1, 0, 0, 0, 0, 0, 0, 4,
++  0, 131, 255, 248, 255, 240, 79, 0, 0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 3, 0, 0, 70, 234, 255, 247, 255, 144, 0, 4, 0, 0, 0, 0, 0, 3, 0, 90, 255, 248, 255,
++  232, 50, 0, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
++  5, 0, 41, 224, 255, 248, 255, 103, 0, 3, 0, 0, 0, 2, 1, 34, 243, 251, 252, 241, 49, 0, 5, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 40,
++  235, 253, 250, 249, 44, 0, 2, 0, 0, 3, 0, 186, 255, 249, 255, 76, 0, 5, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 65, 253, 249, 255,
++  198, 2, 2, 0, 4, 0, 80, 255, 249, 255, 140, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 126, 255, 249, 255, 94, 0, 4,
++  2, 3, 210, 254, 253, 221, 9, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 4, 212, 254, 253, 221, 7, 1, 0, 70, 255, 250,
++  255, 90, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 76, 255, 250, 255, 83, 0, 0, 169, 254, 254, 218, 5, 2, 1,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 2, 1, 207, 254, 254, 182, 0, 20, 236, 254, 255, 122, 0, 4, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 4, 0, 108, 255, 254, 243, 29, 83, 255, 254, 252, 41, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 30,
++  247, 254, 255, 97, 146, 255, 255, 213, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 201, 255, 255, 161,
++  194, 255, 255, 161, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 148, 255, 255, 208, 227, 255, 255, 120,
++  0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 106, 255, 254, 238, 245, 253, 255, 93, 0, 4, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 3, 0, 80, 255, 252, 254, 255, 252, 255, 79, 0, 3, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 3, 0, 66, 255, 253, 255, 255, 252, 255, 78, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0,
++  65, 255, 253, 255, 246, 253, 255, 92, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 79, 255, 252, 255,
++  228, 255, 255, 119, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 105, 255, 254, 239, 197, 255, 255, 159,
++  0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 145, 255, 255, 210, 149, 255, 255, 210, 1, 1, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 1, 0, 198, 255, 255, 164, 86, 255, 254, 251, 37, 0, 2, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 2, 0, 27, 246, 254, 255, 101, 23, 239, 254, 255, 116, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 102,
++  255, 254, 245, 32, 0, 173, 254, 254, 214, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 202, 255, 254, 186, 0,
++  0, 75, 255, 250, 255, 83, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 69, 255, 250, 255, 89, 0, 1, 5, 215, 253,
++  253, 216, 6, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 1, 3, 2, 206, 254, 253, 225, 9, 1, 4, 0, 88, 255, 249, 255, 130, 0,
++  5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 5, 0, 116, 255, 249, 255, 102, 0, 4, 0, 2, 1, 193, 255, 249, 254, 67, 0, 5, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0,
++  56, 250, 250, 255, 205, 4, 2, 1, 0, 2, 1, 41, 247, 250, 253, 236, 40, 0, 4, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 32, 229, 254, 250, 252,
++  51, 0, 3, 0, 0, 0, 3, 0, 100, 255, 248, 255, 225, 41, 0, 5, 1, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 33, 217, 255, 247, 255, 113, 0, 3, 0, 0,
++  0, 0, 0, 4, 0, 142, 255, 247, 255, 233, 68, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 3, 1, 0, 59, 227, 255, 247, 255, 155, 0, 4, 0, 0, 0, 0, 0, 0, 1,
++  3, 0, 158, 255, 248, 255, 254, 125, 6, 0, 1, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
++  4, 1, 0, 2, 117, 250, 255, 248, 255, 170, 0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 143,
++  255, 253, 251, 255, 207, 80, 1, 0, 0, 1, 4, 4, 3, 3, 3, 3, 4, 4, 1, 0, 0, 0, 74, 200,
++  255, 252, 252, 255, 154, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 104, 247, 255, 248,
++  255, 255, 203, 109, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 31, 104, 199, 255, 255, 248, 255, 251, 113,
++  0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 48, 193, 255, 255, 250, 255, 255,
++  247, 200, 148, 107, 81, 66, 65, 80, 105, 146, 197, 245, 255, 255, 250, 255, 255, 200, 56, 0, 3, 1, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 98, 214, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 219, 105, 3, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 7, 85, 179, 240, 255, 255, 255, 255, 252, 253, 253, 252,
++  254, 255, 255, 255, 242, 183, 91, 10, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 33, 97, 159, 206, 236, 253, 255, 255, 253, 238, 208, 162, 101,
++  36, 0, 0, 0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr int k_houseSize = 46;
++constexpr uint8_t k_house[2116] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 4, 2, 0, 0, 0, 0, 8, 22, 33, 33,
++  23, 9, 0, 0, 0, 0, 1, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 0, 0, 34, 95, 152, 193, 219, 233, 241, 241, 234, 220,
++  195, 154, 98, 37, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 2, 0, 0, 11, 95, 188, 246, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 248, 192, 101, 14, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 4, 0, 3, 105, 218, 255, 255, 255, 255, 255, 236, 209, 187, 173, 172, 186, 208, 234, 255, 255, 255,
++  255, 255, 223, 112, 7, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
++  3, 0, 56, 201, 255, 255, 255, 255, 200, 124, 60, 20, 0, 0, 0, 0, 0, 0, 19, 57, 120, 196, 253, 255,
++  255, 255, 207, 64, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 114,
++  251, 255, 255, 252, 165, 59, 0, 0, 0, 0, 0, 2, 3, 3, 2, 0, 0, 0, 0, 0, 54, 159, 249, 255,
++  255, 254, 125, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 1, 154, 255, 252, 255,
++  193, 56, 0, 0, 1, 4, 3, 1, 0, 0, 0, 0, 0, 0, 1, 3, 4, 1, 0, 0, 50, 186, 255, 252,
++  255, 165, 5, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 1, 168, 255, 251, 255, 125, 0, 0,
++  3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 0, 0, 116, 252, 251, 255,
++  179, 5, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 155, 255, 251, 246, 79, 0, 2, 3, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 0, 69, 240, 252, 255, 168,
++  0, 4, 1, 0, 0, 0, 0, 0, 0, 3, 0, 114, 255, 250, 247, 63, 0, 5, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 53, 241, 251, 255, 128, 0,
++  4, 0, 0, 0, 0, 0, 3, 0, 51, 252, 251, 255, 78, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 66, 251, 251, 255, 63, 0, 3,
++  0, 0, 0, 0, 2, 4, 206, 255, 255, 125, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0,
++  136, 145, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 111, 255, 254, 217, 9, 2, 1, 0,
++  0, 4, 0, 102, 255, 255, 198, 0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 4, 159, 255, 255,
++  169, 9, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 186, 255, 255, 117, 0, 4, 0, 1, 1,
++  10, 224, 253, 252, 50, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 19, 188, 255, 251, 250, 255, 198,
++  26, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 39, 248, 253, 233, 16, 1, 1, 4, 0, 93, 255,
++  255, 169, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 40, 214, 255, 251, 255, 255, 251, 255, 222, 49,
++  0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 154, 255, 255, 108, 0, 4, 2, 0, 191, 254, 253, 54,
++  1, 3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 66, 235, 255, 251, 255, 255, 255, 255, 252, 255, 241, 76, 0,
++  4, 1, 0, 0, 0, 0, 0, 0, 2, 1, 42, 250, 254, 204, 1, 2, 0, 31, 248, 255, 203, 0, 2, 0,
++  0, 0, 0, 0, 0, 1, 3, 0, 96, 251, 255, 252, 255, 255, 255, 255, 255, 255, 253, 255, 255, 106, 0, 2,
++  1, 0, 0, 0, 0, 0, 0, 2, 0, 190, 255, 252, 42, 0, 0, 95, 255, 255, 123, 0, 4, 0, 0, 0,
++  0, 0, 2, 1, 0, 127, 255, 254, 253, 255, 255, 255, 255, 255, 255, 255, 255, 253, 253, 255, 138, 0, 0, 2,
++  0, 0, 0, 0, 0, 4, 1, 109, 255, 255, 109, 0, 0, 153, 255, 255, 58, 0, 3, 0, 0, 0, 0, 3,
++  0, 4, 159, 255, 252, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 251, 255, 169, 9, 0, 3, 0,
++  0, 0, 0, 2, 0, 46, 252, 255, 167, 0, 0, 195, 255, 237, 18, 0, 1, 0, 0, 0, 3, 0, 19, 188,
++  255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 198, 26, 0, 4, 0, 0,
++  0, 1, 0, 9, 228, 255, 206, 1, 8, 220, 255, 208, 1, 0, 0, 0, 0, 2, 0, 40, 214, 255, 251, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 222, 49, 0, 2, 0, 0, 0,
++  1, 0, 197, 255, 229, 16, 23, 234, 255, 186, 0, 2, 0, 0, 2, 1, 68, 236, 255, 252, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 242, 77, 1, 2, 0, 0, 3, 0,
++  173, 255, 242, 34, 33, 241, 255, 172, 0, 3, 0, 0, 1, 0, 40, 48, 39, 183, 255, 252, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 194, 39, 47, 43, 0, 0, 0, 0, 4, 0, 158, 255,
++  248, 45, 33, 241, 255, 172, 0, 3, 0, 0, 0, 0, 0, 0, 0, 165, 255, 251, 255, 255, 255, 255, 253, 252,
++  252, 252, 252, 253, 255, 255, 255, 255, 252, 255, 179, 0, 0, 0, 0, 0, 0, 0, 4, 0, 158, 255, 248, 45,
++  24, 235, 255, 185, 0, 2, 0, 0, 0, 0, 1, 5, 2, 169, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 252, 255, 183, 2, 5, 2, 0, 0, 0, 0, 3, 0, 172, 255, 242, 35, 9, 221,
++  255, 207, 0, 0, 0, 0, 0, 0, 0, 3, 0, 168, 255, 251, 255, 255, 255, 255, 207, 191, 192, 192, 191, 204,
++  255, 255, 255, 255, 252, 255, 182, 0, 3, 0, 0, 0, 0, 0, 1, 0, 195, 255, 230, 18, 0, 197, 255, 235,
++  16, 0, 1, 0, 0, 0, 0, 3, 0, 168, 255, 251, 255, 255, 253, 255, 57, 0, 0, 0, 0, 43, 255, 254,
++  255, 255, 252, 255, 182, 0, 3, 0, 0, 0, 0, 1, 0, 8, 226, 255, 208, 2, 0, 156, 255, 254, 55, 0,
++  3, 0, 0, 0, 0, 3, 0, 168, 255, 251, 255, 255, 253, 255, 66, 2, 5, 4, 2, 53, 255, 254, 255, 255,
++  252, 255, 182, 0, 3, 0, 0, 0, 0, 2, 0, 43, 251, 255, 170, 0, 0, 99, 255, 255, 119, 0, 4, 0,
++  0, 0, 0, 3, 0, 168, 255, 251, 255, 255, 253, 255, 64, 0, 3, 2, 0, 51, 255, 254, 255, 255, 252, 255,
++  182, 0, 3, 0, 0, 0, 0, 4, 1, 105, 255, 255, 113, 0, 0, 34, 249, 255, 199, 0, 2, 0, 0, 0,
++  0, 3, 0, 168, 255, 251, 255, 255, 253, 255, 64, 0, 3, 2, 0, 51, 255, 254, 255, 255, 252, 255, 182, 0,
++  3, 0, 0, 0, 0, 2, 0, 186, 255, 253, 45, 0, 2, 0, 196, 254, 252, 48, 1, 3, 0, 0, 0, 3,
++  0, 168, 255, 251, 255, 255, 253, 255, 64, 0, 3, 2, 0, 51, 255, 254, 255, 255, 252, 255, 182, 0, 3, 0,
++  0, 0, 2, 1, 37, 248, 254, 209, 2, 1, 4, 0, 99, 255, 255, 162, 0, 3, 0, 0, 0, 3, 0, 168,
++  254, 250, 254, 254, 252, 254, 64, 0, 3, 2, 0, 51, 254, 253, 254, 254, 251, 254, 182, 0, 3, 0, 0, 0,
++  4, 0, 147, 255, 255, 114, 0, 4, 1, 1, 13, 229, 253, 249, 44, 0, 3, 0, 0, 3, 0, 169, 255, 252,
++  255, 255, 254, 255, 64, 0, 3, 2, 0, 51, 255, 255, 255, 255, 253, 255, 183, 0, 3, 0, 0, 2, 1, 33,
++  245, 253, 237, 19, 1, 1, 0, 4, 0, 110, 255, 255, 190, 0, 4, 1, 0, 3, 0, 165, 251, 247, 251, 251,
++  249, 251, 63, 0, 3, 2, 0, 50, 251, 250, 251, 251, 248, 251, 179, 0, 3, 0, 0, 4, 0, 178, 255, 255,
++  125, 0, 4, 0, 0, 1, 2, 7, 213, 255, 255, 115, 0, 5, 0, 0, 0, 22, 34, 34, 34, 34, 34, 34,
++  9, 0, 0, 0, 0, 7, 34, 34, 34, 34, 34, 34, 24, 0, 0, 0, 5, 0, 101, 255, 254, 223, 12, 2,
++  1, 0, 0, 0, 3, 0, 59, 255, 251, 252, 67, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 56, 248, 251, 255, 71, 0, 3, 0, 0,
++  0, 0, 0, 4, 0, 124, 255, 251, 241, 53, 0, 5, 0, 1, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0,
++  0, 0, 2, 2, 2, 2, 2, 2, 1, 0, 5, 0, 43, 235, 252, 255, 138, 0, 4, 0, 0, 0, 0, 0,
++  0, 0, 4, 0, 166, 255, 252, 240, 68, 0, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 2, 3, 0, 58, 233, 253, 255, 179, 1, 3, 1, 0, 0, 0, 0, 0, 0, 0,
++  1, 2, 5, 179, 255, 252, 251, 112, 0, 0, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 2, 4, 0, 0, 102, 247, 253, 255, 190, 10, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
++  1, 5, 167, 255, 252, 255, 181, 45, 0, 0, 2, 4, 2, 1, 0, 0, 0, 0, 0, 0, 1, 2, 4, 2,
++  0, 0, 39, 173, 255, 252, 255, 177, 10, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
++  0, 128, 255, 255, 255, 247, 152, 47, 0, 0, 0, 0, 1, 3, 4, 4, 3, 1, 0, 0, 0, 0, 43, 145,
++  243, 255, 255, 255, 138, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0,
++  67, 211, 255, 255, 255, 250, 188, 110, 48, 12, 0, 0, 0, 0, 0, 0, 10, 45, 106, 184, 248, 255, 255, 255,
++  218, 76, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 9,
++  118, 228, 255, 255, 255, 255, 253, 227, 197, 174, 159, 158, 173, 196, 225, 252, 255, 255, 255, 255, 232, 126, 13, 0,
++  3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 18,
++  109, 200, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 204, 115, 22, 0, 0, 3, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 0, 0,
++  45, 109, 165, 204, 228, 241, 247, 247, 241, 229, 206, 168, 112, 48, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 4, 0, 0, 0,
++  0, 0, 17, 33, 44, 45, 34, 18, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0,
++};
++constexpr int k_a_buttonSize = 14;
++constexpr uint8_t k_a_button[196] = {
++  0, 3, 0, 33, 144, 219, 250, 250, 220, 146, 35, 0, 3, 0, 3, 0, 91, 234, 255, 255, 255, 255, 255, 255,
++  236, 94, 0, 3, 0, 88, 255, 255, 252, 254, 254, 254, 254, 252, 255, 255, 92, 0, 31, 240, 254, 252, 255, 255,
++  255, 255, 255, 255, 253, 253, 243, 33, 146, 255, 252, 255, 254, 255, 78, 57, 249, 255, 255, 252, 255, 151, 224, 254,
++  254, 253, 255, 208, 0, 0, 184, 254, 252, 254, 254, 228, 252, 255, 255, 251, 255, 104, 71, 87, 76, 255, 252, 255,
++  255, 254, 252, 255, 254, 254, 252, 18, 151, 172, 5, 243, 255, 254, 255, 254, 225, 254, 251, 255, 198, 0, 24, 26,
++  0, 174, 255, 250, 254, 229, 148, 255, 248, 255, 73, 38, 213, 212, 53, 48, 255, 249, 255, 153, 32, 242, 253, 253,
++  162, 201, 255, 255, 208, 155, 251, 253, 244, 35, 0, 92, 255, 255, 255, 255, 253, 253, 255, 255, 255, 255, 96, 0,
++  3, 0, 95, 237, 255, 255, 255, 255, 255, 255, 238, 98, 0, 3, 0, 3, 0, 36, 149, 223, 252, 252, 224, 151,
++  38, 0, 3, 0,
++};
++constexpr int k_a_button_bigSize = 20;
++constexpr uint8_t k_a_button_big[400] = {
++  0, 0, 0, 3, 0, 12, 100, 183, 231, 252, 252, 232, 184, 102, 13, 0, 3, 0, 0, 0, 0, 1, 2, 0,
++  88, 215, 255, 255, 255, 255, 255, 255, 255, 255, 218, 91, 0, 2, 1, 0, 1, 3, 0, 145, 255, 255, 253, 253,
++  254, 255, 255, 254, 253, 253, 255, 255, 150, 0, 3, 1, 3, 0, 146, 255, 251, 253, 255, 255, 255, 253, 253, 255,
++  255, 255, 253, 250, 255, 152, 0, 3, 0, 84, 255, 250, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  250, 255, 90, 0, 12, 222, 254, 253, 255, 255, 255, 255, 255, 227, 225, 253, 255, 255, 255, 255, 253, 254, 227, 14,
++  99, 255, 253, 255, 255, 255, 253, 255, 206, 11, 8, 173, 254, 251, 255, 255, 255, 253, 255, 105, 186, 254, 252, 255,
++  255, 255, 251, 255, 118, 0, 0, 78, 255, 252, 255, 255, 255, 253, 254, 192, 234, 255, 254, 255, 255, 254, 254, 250,
++  26, 38, 56, 8, 234, 255, 254, 255, 255, 254, 255, 239, 253, 255, 255, 255, 255, 252, 255, 194, 0, 130, 159, 0,
++  158, 254, 251, 255, 255, 255, 255, 255, 253, 255, 255, 255, 255, 252, 255, 101, 2, 227, 250, 5, 63, 255, 253, 255,
++  255, 255, 255, 255, 234, 255, 254, 255, 254, 255, 242, 20, 3, 113, 118, 12, 2, 221, 255, 253, 255, 254, 255, 240,
++  188, 254, 253, 255, 251, 255, 175, 1, 8, 0, 0, 9, 2, 141, 255, 251, 255, 253, 254, 194, 101, 255, 253, 255,
++  252, 255, 73, 0, 179, 238, 238, 196, 0, 40, 252, 254, 255, 253, 255, 108, 13, 225, 254, 252, 255, 240, 53, 64,
++  253, 255, 255, 255, 78, 44, 222, 255, 251, 253, 229, 16, 0, 88, 255, 250, 255, 253, 255, 255, 255, 254, 254, 254,
++  255, 255, 253, 255, 249, 255, 94, 0, 3, 0, 151, 255, 250, 254, 255, 254, 255, 255, 255, 255, 254, 255, 254, 250,
++  255, 157, 0, 3, 1, 3, 0, 151, 255, 255, 252, 253, 254, 255, 255, 254, 253, 252, 255, 255, 156, 1, 3, 1,
++  0, 1, 2, 0, 93, 220, 255, 255, 255, 255, 255, 255, 255, 255, 222, 97, 0, 1, 1, 0, 0, 0, 0, 2,
++  0, 15, 106, 189, 236, 254, 254, 237, 191, 108, 17, 0, 2, 1, 0, 0,
++};
++constexpr int k_consoleSize = 22;
++constexpr uint8_t k_console[484] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2,
++  1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 1, 0, 0, 0, 2, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0, 12, 39, 28, 43, 42, 42,
++  42, 42, 42, 42, 42, 42, 42, 42, 43, 29, 39, 14, 0, 1, 0, 62, 225, 216, 160, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 164, 212, 228, 67, 0, 11, 220, 255, 211, 152, 171, 151, 153, 153, 153, 153, 153,
++  153, 153, 153, 151, 169, 154, 208, 255, 226, 14, 40, 253, 254, 226, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 109, 220, 253, 252, 47, 55, 184, 22, 187, 119, 13, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
++  13, 108, 220, 255, 250, 47, 49, 213, 117, 205, 116, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 108,
++  220, 255, 251, 47, 40, 254, 255, 227, 110, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 108, 219, 251,
++  250, 47, 41, 247, 251, 222, 111, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 107, 223, 255, 255, 46,
++  41, 248, 255, 223, 111, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 112, 206, 125, 215, 55, 41, 247,
++  255, 223, 111, 15, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 11, 116, 189, 18, 178, 63, 41, 249, 254, 223,
++  112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 108, 223, 251, 254, 47, 12, 223, 255, 211, 150, 164,
++  143, 146, 145, 145, 145, 145, 145, 145, 146, 143, 162, 153, 207, 255, 228, 15, 0, 67, 230, 218, 162, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 166, 214, 232, 71, 0, 1, 0, 16, 44, 32, 49, 47, 48, 48, 48,
++  48, 48, 48, 48, 48, 47, 49, 32, 44, 18, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3,
++  3, 3, 3, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0,
++};
++constexpr int k_avatarSize = 14;
++constexpr uint8_t k_avatar[196] = {
++  0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 3, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 82,
++  210, 211, 85, 0, 2, 0, 0, 0, 0, 0, 2, 0, 30, 249, 255, 255, 251, 33, 0, 2, 0, 0, 0, 0,
++  3, 0, 62, 255, 247, 247, 255, 66, 0, 3, 0, 0, 0, 0, 1, 1, 13, 215, 255, 255, 218, 14, 1, 1,
++  0, 0, 0, 0, 0, 3, 0, 8, 111, 112, 10, 0, 3, 0, 0, 0, 0, 0, 1, 0, 8, 85, 126, 127,
++  86, 9, 0, 1, 0, 0, 0, 2, 1, 31, 207, 255, 255, 255, 255, 209, 33, 1, 2, 0, 0, 3, 0, 177,
++  255, 249, 251, 251, 249, 255, 181, 0, 2, 0, 1, 0, 4, 230, 252, 253, 255, 255, 253, 252, 232, 6, 0, 1,
++  0, 3, 0, 171, 255, 252, 255, 255, 252, 255, 175, 0, 3, 0, 0, 2, 1, 30, 214, 254, 253, 253, 254, 216,
++  32, 1, 2, 0,
++};
++constexpr int k_avatar_discSize = 21;
++constexpr uint8_t k_avatar_disc[441] = {
++  0, 0, 0, 3, 0, 0, 61, 151, 213, 244, 253, 245, 215, 153, 64, 0, 0, 3, 0, 0, 0, 0, 0, 3,
++  0, 41, 176, 253, 255, 255, 255, 255, 255, 255, 255, 254, 179, 44, 0, 3, 0, 0, 0, 3, 0, 86, 244, 255,
++  255, 252, 254, 255, 255, 255, 254, 252, 254, 255, 246, 91, 0, 4, 0, 3, 0, 84, 255, 255, 251, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 251, 255, 255, 90, 0, 3, 1, 38, 246, 253, 253, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 253, 253, 248, 42, 1, 0, 180, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 252, 255, 186, 0, 58, 254, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  253, 255, 64, 154, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 161,
++  217, 255, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 223, 246, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 247, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 251, 218, 255, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 254, 255, 224, 156, 255, 252, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  255, 255, 255, 252, 255, 163, 60, 255, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
++  253, 255, 66, 0, 184, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 255, 190, 0,
++  1, 41, 248, 253, 253, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 253, 252, 250, 45, 0, 3, 0, 89,
++  255, 255, 251, 255, 255, 255, 255, 255, 255, 255, 255, 255, 252, 254, 255, 95, 0, 3, 0, 3, 0, 91, 247, 255,
++  254, 252, 254, 255, 255, 255, 254, 252, 254, 255, 249, 96, 0, 4, 0, 0, 0, 3, 0, 46, 182, 255, 255, 255,
++  255, 255, 255, 255, 255, 255, 185, 49, 0, 3, 0, 0, 0, 0, 0, 3, 0, 0, 67, 158, 219, 249, 254, 249,
++  221, 160, 70, 0, 0, 3, 0, 0, 0,
++};
++constexpr uint8_t k_shadow[1600] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
++  2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 3, 4, 5, 5, 6, 6, 6, 6, 5, 5,
++  4, 3, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 1, 1, 3, 4, 5, 7, 9, 10, 11, 12, 13, 13, 12, 11, 10, 9, 7, 5, 4, 3, 1, 1, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 6, 8, 11, 14, 16,
++  19, 21, 22, 23, 23, 22, 21, 19, 17, 14, 11, 8, 6, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 1, 1, 3, 5, 8, 11, 15, 19, 23, 27, 30, 32, 34, 35, 35, 34, 32, 30,
++  27, 23, 19, 15, 11, 8, 5, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3,
++  6, 10, 14, 19, 24, 30, 35, 39, 43, 45, 47, 48, 48, 47, 45, 43, 39, 35, 30, 24, 19, 14, 10, 6,
++  3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 7, 11, 16, 22, 29, 35, 41, 47, 51,
++  56, 58, 60, 61, 61, 60, 58, 56, 52, 47, 41, 35, 29, 22, 16, 11, 7, 4, 2, 1, 0, 0, 0, 0,
++  0, 0, 0, 0, 1, 3, 7, 11, 17, 24, 31, 39, 47, 53, 59, 64, 67, 70, 71, 72, 72, 71, 70, 67,
++  64, 59, 53, 47, 39, 32, 24, 17, 11, 7, 4, 1, 0, 0, 0, 0, 0, 0, 0, 1, 3, 6, 11, 17,
++  25, 33, 42, 50, 58, 64, 69, 73, 76, 78, 79, 80, 80, 79, 78, 76, 73, 69, 64, 58, 51, 42, 33, 25,
++  17, 11, 6, 3, 1, 0, 0, 0, 0, 0, 1, 2, 5, 10, 16, 24, 33, 43, 52, 60, 67, 73, 77, 80,
++  82, 84, 84, 85, 85, 84, 84, 82, 80, 77, 73, 68, 61, 52, 43, 33, 24, 16, 10, 5, 2, 1, 0, 0,
++  0, 0, 1, 4, 8, 14, 22, 31, 42, 52, 61, 69, 75, 79, 83, 85, 86, 87, 87, 87, 87, 87, 87, 86,
++  85, 83, 80, 75, 70, 61, 52, 42, 32, 22, 14, 8, 4, 1, 0, 0, 0, 1, 2, 6, 11, 19, 29, 39,
++  50, 60, 69, 76, 81, 84, 86, 87, 88, 88, 88, 88, 88, 88, 88, 88, 87, 86, 84, 81, 76, 70, 60, 51,
++  39, 29, 19, 11, 6, 3, 1, 0, 0, 1, 4, 8, 15, 24, 35, 46, 58, 67, 75, 81, 84, 86, 88, 88,
++  88, 89, 89, 89, 89, 89, 89, 88, 88, 88, 87, 85, 81, 75, 68, 58, 47, 36, 25, 15, 8, 4, 1, 0,
++  0, 2, 5, 11, 19, 30, 41, 53, 64, 73, 80, 84, 86, 88, 88, 89, 89, 89, 89, 89, 89, 89, 89, 89,
++  89, 88, 88, 87, 84, 80, 73, 65, 53, 42, 30, 19, 11, 5, 2, 0, 1, 3, 7, 14, 23, 35, 47, 59,
++  69, 77, 82, 86, 88, 88, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 88, 88, 86, 83, 77, 70,
++  59, 47, 35, 24, 14, 7, 3, 1, 1, 4, 9, 16, 27, 39, 51, 63, 73, 80, 85, 87, 88, 89, 89, 89,
++  89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 88, 87, 85, 80, 73, 64, 52, 39, 27, 17, 9, 4, 1,
++  2, 5, 10, 19, 30, 42, 55, 67, 76, 82, 86, 88, 88, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89,
++  89, 89, 89, 88, 88, 86, 82, 76, 67, 56, 43, 30, 19, 10, 5, 2, 2, 5, 11, 21, 32, 45, 58, 69,
++  78, 84, 87, 88, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 88, 87, 84, 78,
++  70, 59, 46, 33, 21, 12, 5, 2, 2, 6, 12, 22, 34, 47, 60, 71, 79, 84, 87, 88, 89, 89, 89, 89,
++  89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 88, 87, 85, 79, 72, 60, 47, 35, 22, 12, 6, 2,
++  2, 6, 13, 23, 35, 48, 61, 72, 80, 85, 87, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89,
++  89, 89, 89, 89, 89, 87, 85, 80, 72, 61, 48, 35, 23, 13, 6, 2, 2, 6, 13, 23, 35, 48, 61, 72,
++  80, 85, 87, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 87, 85, 80,
++  72, 61, 49, 35, 23, 13, 6, 2, 2, 6, 12, 22, 34, 47, 60, 71, 79, 85, 87, 88, 89, 89, 89, 89,
++  89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 88, 87, 85, 79, 72, 60, 47, 35, 22, 12, 6, 2,
++  2, 5, 11, 21, 32, 45, 58, 70, 78, 84, 87, 88, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89,
++  89, 89, 89, 89, 88, 87, 84, 78, 70, 59, 46, 33, 21, 12, 5, 2, 2, 5, 10, 19, 30, 43, 56, 67,
++  76, 82, 86, 88, 88, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 88, 88, 86, 82, 76,
++  67, 56, 43, 30, 19, 10, 5, 2, 1, 4, 9, 17, 27, 39, 52, 64, 73, 80, 85, 87, 88, 89, 89, 89,
++  89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 88, 87, 85, 80, 73, 64, 52, 39, 27, 17, 9, 4, 1,
++  1, 3, 7, 14, 23, 35, 47, 59, 69, 77, 82, 86, 88, 88, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89,
++  89, 89, 88, 88, 86, 83, 78, 70, 59, 47, 35, 24, 14, 7, 3, 1, 0, 2, 5, 11, 19, 30, 42, 53,
++  64, 73, 80, 84, 86, 88, 88, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 88, 88, 87, 84, 80, 73, 65,
++  54, 42, 30, 20, 11, 5, 2, 0, 0, 1, 4, 8, 15, 24, 35, 47, 58, 68, 75, 81, 84, 87, 88, 88,
++  89, 89, 89, 89, 89, 89, 89, 89, 88, 88, 87, 85, 81, 75, 68, 58, 47, 36, 25, 16, 9, 4, 1, 0,
++  0, 1, 2, 6, 11, 19, 29, 39, 50, 61, 69, 76, 81, 84, 86, 87, 88, 88, 88, 88, 88, 88, 88, 88,
++  87, 86, 84, 81, 76, 70, 61, 51, 40, 29, 19, 12, 6, 3, 1, 0, 0, 0, 1, 4, 8, 14, 22, 32,
++  42, 52, 61, 69, 75, 80, 83, 85, 86, 87, 87, 87, 87, 87, 87, 86, 85, 83, 80, 75, 70, 62, 52, 43,
++  32, 23, 14, 8, 4, 1, 0, 0, 0, 0, 1, 2, 5, 10, 16, 24, 33, 43, 52, 61, 68, 73, 77, 80,
++  82, 84, 85, 85, 85, 85, 84, 82, 80, 78, 73, 68, 61, 53, 43, 33, 24, 17, 10, 5, 2, 1, 0, 0,
++  0, 0, 0, 1, 3, 6, 11, 17, 25, 33, 42, 51, 58, 65, 70, 73, 76, 78, 79, 80, 80, 79, 78, 76,
++  73, 70, 65, 58, 51, 43, 33, 25, 17, 11, 7, 3, 1, 0, 0, 0, 0, 0, 0, 0, 1, 3, 7, 11,
++  17, 24, 32, 39, 47, 53, 59, 64, 67, 70, 71, 72, 72, 71, 70, 67, 64, 59, 54, 47, 40, 32, 24, 17,
++  11, 7, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 7, 11, 16, 22, 29, 36, 42, 47, 52,
++  56, 58, 60, 61, 61, 60, 59, 56, 52, 47, 42, 36, 29, 23, 16, 11, 7, 4, 2, 1, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 1, 2, 3, 6, 10, 14, 19, 25, 30, 35, 39, 43, 46, 47, 49, 49, 47, 46, 43,
++  39, 35, 30, 25, 19, 14, 10, 6, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2,
++  3, 5, 8, 11, 16, 19, 24, 27, 30, 33, 35, 35, 35, 35, 33, 30, 28, 24, 20, 16, 12, 8, 5, 3,
++  2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 6, 9, 12, 15, 18,
++  20, 22, 24, 24, 24, 24, 22, 21, 18, 15, 12, 9, 7, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 5, 7, 9, 11, 13, 15, 16, 16, 16, 16, 15, 13,
++  11, 9, 7, 5, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr uint8_t it_calculation_glyph[289] = {
++  0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0, 73, 169, 176, 178, 177,
++  176, 166, 176, 177, 176, 175, 170, 76, 0, 1, 0, 74, 241, 130, 113, 108, 116, 119, 218, 121, 116, 117, 116, 128,
++  241, 79, 0, 0, 176, 128, 0, 0, 16, 0, 0, 156, 0, 0, 0, 0, 0, 122, 181, 0, 0, 178, 110, 12,
++  93, 181, 41, 12, 169, 12, 40, 50, 53, 14, 103, 181, 0, 0, 178, 107, 29, 175, 220, 122, 5, 168, 6, 119,
++  154, 155, 32, 101, 182, 0, 0, 177, 115, 0, 27, 116, 0, 7, 166, 9, 0, 0, 0, 0, 109, 181, 0, 0,
++  177, 117, 7, 12, 5, 9, 13, 168, 16, 9, 9, 13, 7, 113, 181, 0, 0, 166, 207, 162, 169, 169, 164, 168,
++  224, 170, 169, 170, 171, 165, 204, 171, 0, 0, 177, 118, 18, 9, 0, 15, 20, 168, 20, 0, 0, 0, 6, 116,
++  180, 0, 0, 180, 96, 70, 151, 42, 180, 17, 163, 6, 66, 85, 88, 16, 102, 182, 0, 0, 176, 119, 0, 159,
++  255, 44, 0, 170, 7, 108, 139, 141, 29, 102, 182, 0, 0, 179, 103, 45, 188, 161, 150, 12, 169, 10, 116, 148,
++  150, 34, 98, 182, 0, 0, 179, 114, 30, 40, 0, 76, 0, 154, 0, 0, 0, 0, 0, 119, 182, 0, 0, 77,
++  243, 115, 99, 112, 92, 111, 216, 115, 109, 110, 109, 122, 240, 82, 0, 1, 0, 78, 175, 182, 181, 184, 181, 171,
++  181, 181, 181, 180, 174, 81, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
++  0,
++};
++constexpr uint8_t it_calculation_glyph_big[441] = {
++  0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0,
++  30, 83, 87, 87, 87, 87, 87, 82, 87, 87, 87, 87, 87, 83, 32, 0, 1, 0, 3, 0, 101, 254, 245, 243,
++  247, 244, 243, 245, 255, 245, 243, 244, 244, 243, 245, 255, 106, 0, 2, 0, 30, 255, 119, 10, 8, 0, 6, 6,
++  17, 197, 22, 6, 7, 6, 9, 9, 113, 255, 35, 0, 0, 86, 246, 0, 0, 0, 72, 3, 0, 10, 197, 15,
++  0, 0, 0, 0, 0, 0, 243, 93, 0, 0, 87, 242, 7, 5, 24, 214, 31, 5, 13, 199, 17, 5, 13, 11,
++  13, 5, 4, 239, 95, 0, 0, 87, 246, 2, 74, 200, 230, 201, 81, 3, 204, 4, 76, 198, 192, 198, 79, 1,
++  243, 95, 0, 0, 87, 243, 6, 8, 31, 216, 38, 8, 13, 199, 16, 8, 20, 19, 20, 8, 3, 240, 95, 0,
++  0, 87, 243, 2, 0, 0, 80, 1, 0, 9, 197, 14, 0, 0, 0, 0, 0, 0, 240, 95, 0, 0, 87, 244,
++  17, 13, 13, 0, 13, 13, 24, 201, 29, 13, 14, 13, 14, 13, 14, 241, 95, 0, 0, 82, 252, 197, 200, 201,
++  201, 201, 201, 200, 242, 202, 198, 198, 198, 198, 198, 195, 252, 89, 0, 0, 87, 243, 22, 4, 6, 20, 7, 3,
++  29, 202, 33, 17, 19, 18, 19, 17, 18, 241, 94, 0, 0, 87, 246, 0, 102, 79, 0, 70, 109, 0, 199, 13,
++  0, 0, 0, 0, 0, 0, 240, 95, 0, 0, 87, 246, 3, 76, 229, 112, 227, 85, 5, 203, 6, 70, 180, 174,
++  180, 72, 1, 243, 95, 0, 0, 87, 243, 10, 0, 101, 255, 115, 0, 18, 199, 11, 35, 93, 89, 93, 37, 1,
++  242, 95, 0, 0, 87, 245, 4, 75, 229, 113, 226, 84, 5, 203, 6, 70, 180, 174, 180, 73, 2, 242, 95, 0,
++  0, 86, 248, 0, 105, 83, 0, 74, 112, 2, 200, 16, 0, 0, 0, 0, 0, 0, 242, 94, 0, 0, 32, 255,
++  113, 0, 0, 6, 0, 0, 14, 195, 18, 2, 4, 3, 5, 6, 107, 255, 37, 0, 3, 0, 106, 255, 244, 242,
++  240, 242, 242, 241, 255, 242, 240, 240, 240, 240, 241, 255, 112, 0, 2, 0, 1, 0, 35, 90, 94, 94, 95, 95,
++  94, 89, 94, 95, 95, 94, 94, 90, 37, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 2, 0, 0,
++};
++constexpr uint8_t it_solver_glyph[289] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 3, 2, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 2, 0, 0, 0, 1, 4, 4, 4, 4, 4, 3, 0, 1, 0, 13, 83, 44, 0, 55, 81, 4, 0, 0,
++  0, 0, 0, 0, 0, 0, 1, 2, 8, 208, 242, 51, 255, 168, 2, 28, 154, 154, 154, 151, 154, 100, 0, 0,
++  2, 0, 32, 236, 240, 210, 9, 1, 33, 192, 193, 193, 190, 193, 125, 0, 0, 0, 4, 0, 149, 255, 105, 0,
++  4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 43, 244, 234, 225, 18, 0, 33, 187, 187, 187, 184, 187,
++  121, 0, 1, 2, 13, 224, 224, 44, 255, 184, 4, 29, 160, 160, 160, 157, 160, 103, 0, 1, 0, 19, 85, 37,
++  0, 58, 84, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1, 4, 4,
++  4, 4, 4, 3, 0, 0, 0, 1, 3, 2, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0,
++};
++constexpr uint8_t it_solver_glyph_big[441] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1,
++  1, 1, 1, 1, 0, 0, 0, 0, 0, 13, 10, 1, 1, 0, 9, 16, 1, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 3, 0, 70, 234, 191, 0, 87, 232, 155, 2, 2, 13, 16, 16, 16, 16, 16, 16, 6, 0,
++  0, 0, 3, 0, 175, 255, 119, 218, 249, 33, 1, 0, 207, 255, 255, 255, 255, 255, 255, 88, 0, 0, 0, 2,
++  1, 22, 224, 255, 254, 94, 0, 4, 0, 104, 129, 128, 129, 129, 127, 129, 44, 0, 0, 0, 0, 4, 0, 134,
++  254, 219, 0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 32, 234, 255, 255, 120,
++  0, 4, 0, 97, 122, 121, 122, 122, 120, 122, 42, 0, 0, 0, 2, 3, 193, 255, 99, 223, 255, 48, 0, 0,
++  210, 255, 255, 255, 255, 255, 255, 90, 0, 0, 3, 0, 90, 237, 172, 0, 97, 233, 174, 5, 1, 17, 21, 21,
++  21, 21, 20, 21, 7, 0, 0, 0, 0, 15, 11, 0, 2, 0, 12, 17, 3, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0,
++  0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr uint8_t it_finance_glyph[289] = {
++  0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 14, 95,
++  156, 175, 156, 97, 15, 0, 2, 0, 0, 0, 0, 0, 3, 0, 106, 241, 234, 182, 161, 181, 233, 242, 109, 0,
++  3, 0, 0, 0, 3, 0, 146, 253, 102, 5, 0, 0, 0, 7, 99, 251, 150, 0, 3, 0, 3, 0, 104, 255,
++  47, 0, 0, 2, 0, 0, 0, 0, 44, 255, 110, 0, 3, 1, 14, 250, 102, 0, 9, 5, 5, 133, 185, 93,
++  0, 0, 96, 253, 16, 1, 0, 95, 238, 1, 3, 0, 0, 156, 216, 126, 255, 104, 2, 1, 234, 101, 0, 0,
++  160, 180, 0, 1, 38, 160, 253, 191, 109, 92, 107, 2, 0, 175, 165, 0, 0, 179, 157, 1, 4, 26, 122, 242,
++  109, 85, 0, 0, 5, 1, 151, 184, 0, 0, 160, 179, 0, 2, 43, 187, 250, 179, 77, 44, 73, 2, 0, 174,
++  166, 0, 0, 97, 236, 1, 2, 13, 30, 209, 202, 75, 241, 125, 2, 1, 233, 103, 0, 1, 15, 252, 98, 0,
++  6, 0, 41, 202, 235, 161, 6, 0, 93, 254, 17, 0, 3, 0, 108, 255, 44, 0, 2, 0, 0, 15, 0, 0,
++  40, 255, 114, 0, 3, 0, 3, 0, 150, 251, 97, 2, 0, 0, 0, 3, 94, 249, 155, 0, 3, 0, 0, 0,
++  3, 0, 111, 244, 231, 177, 156, 177, 230, 245, 115, 0, 3, 1, 0, 0, 0, 0, 2, 0, 17, 101, 161, 180,
++  162, 102, 18, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0,
++  0,
++};
++constexpr uint8_t it_finance_glyph_big[441] = {
++  0, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0, 0, 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 1, 1, 0, 0, 28, 64, 79, 65, 29, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0,
++  90, 206, 255, 255, 255, 255, 255, 209, 93, 0, 0, 2, 0, 0, 0, 0, 0, 2, 0, 22, 185, 255, 209, 114,
++  60, 44, 59, 112, 206, 255, 190, 25, 0, 2, 0, 0, 0, 2, 2, 20, 215, 252, 88, 0, 0, 0, 0, 0,
++  0, 0, 84, 249, 219, 24, 1, 2, 0, 0, 2, 0, 187, 251, 48, 0, 2, 4, 4, 0, 0, 0, 3, 0,
++  44, 248, 193, 1, 2, 0, 4, 0, 86, 255, 86, 0, 6, 1, 2, 0, 55, 105, 66, 0, 7, 0, 80, 255,
++  93, 0, 4, 2, 0, 212, 211, 0, 4, 0, 3, 0, 119, 255, 252, 255, 153, 0, 5, 0, 204, 219, 0, 2,
++  0, 26, 255, 111, 1, 4, 1, 0, 29, 255, 142, 11, 106, 255, 64, 0, 1, 103, 255, 31, 0, 0, 66, 254,
++  56, 0, 2, 3, 186, 231, 253, 220, 215, 42, 86, 41, 1, 0, 50, 254, 73, 0, 0, 82, 255, 41, 0, 1,
++  6, 52, 156, 247, 63, 61, 12, 0, 0, 2, 0, 36, 255, 89, 0, 0, 67, 254, 56, 0, 3, 3, 150, 223,
++  247, 175, 147, 0, 35, 17, 2, 0, 50, 254, 73, 0, 0, 28, 255, 108, 1, 3, 5, 99, 134, 255, 171, 63,
++  46, 255, 66, 0, 1, 101, 255, 33, 0, 2, 0, 215, 208, 0, 4, 1, 0, 0, 198, 241, 158, 246, 207, 5,
++  3, 0, 202, 221, 0, 1, 4, 0, 89, 255, 82, 0, 6, 5, 3, 20, 155, 215, 163, 25, 5, 0, 75, 255,
++  96, 0, 4, 0, 2, 1, 191, 248, 44, 0, 3, 4, 0, 0, 0, 0, 0, 0, 39, 245, 197, 2, 2, 0,
++  0, 2, 1, 23, 219, 248, 82, 0, 0, 0, 0, 0, 0, 0, 78, 245, 224, 26, 1, 2, 0, 0, 0, 2,
++  0, 25, 191, 255, 202, 106, 54, 39, 53, 105, 200, 255, 196, 28, 0, 2, 0, 0, 0, 0, 0, 2, 0, 0,
++  96, 213, 255, 255, 255, 255, 255, 215, 100, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 33,
++  70, 86, 71, 34, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 1, 0, 0, 0, 0,
++  0, 0, 4, 1, 0, 0, 0, 0, 0,
++};
++constexpr uint8_t it_graph_glyph[289] = {
++  0, 15, 19, 0, 1, 0, 0, 0, 2, 4, 3, 0, 0, 0, 0, 0, 0, 0, 123, 154, 0, 4, 0, 0,
++  2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 132, 168, 0, 4, 0, 3, 0, 38, 121, 83, 0, 1, 1,
++  0, 0, 0, 0, 130, 164, 0, 4, 3, 0, 89, 238, 175, 216, 176, 0, 3, 1, 0, 0, 0, 130, 165, 0,
++  7, 0, 50, 253, 63, 0, 4, 208, 152, 0, 3, 0, 0, 0, 130, 165, 0, 5, 1, 215, 113, 0, 9, 0,
++  18, 244, 59, 1, 3, 0, 0, 130, 165, 0, 0, 94, 219, 0, 4, 0, 4, 0, 118, 203, 0, 2, 0, 0,
++  130, 165, 0, 1, 214, 95, 0, 4, 0, 1, 2, 9, 233, 58, 0, 3, 0, 130, 167, 0, 64, 226, 6, 1,
++  1, 0, 0, 4, 0, 143, 171, 0, 4, 0, 130, 169, 0, 172, 148, 0, 4, 0, 0, 0, 2, 0, 39, 235,
++  17, 0, 0, 131, 162, 0, 233, 51, 0, 2, 0, 0, 0, 0, 2, 0, 207, 96, 1, 0, 133, 148, 52, 219,
++  0, 1, 0, 0, 0, 0, 0, 4, 1, 123, 180, 0, 0, 134, 144, 158, 157, 4, 8, 4, 4, 4, 4, 4,
++  6, 4, 43, 240, 22, 0, 132, 143, 103, 38, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 36, 0, 127,
++  233, 142, 152, 154, 154, 154, 154, 154, 154, 154, 154, 154, 154, 137, 18, 0, 39, 129, 142, 142, 141, 141, 141, 141,
++  141, 141, 141, 141, 141, 141, 135, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0,
++};
++constexpr uint8_t it_graph_glyph_big[441] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 22, 205,
++  35, 0, 1, 0, 0, 0, 0, 3, 2, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 32, 255, 55, 0, 2,
++  0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 30, 253, 51, 0, 2, 0, 1, 2,
++  0, 110, 212, 211, 105, 0, 2, 1, 0, 0, 0, 0, 0, 30, 255, 52, 0, 2, 1, 3, 0, 164, 255, 141,
++  144, 255, 157, 0, 3, 0, 0, 0, 0, 0, 30, 255, 52, 0, 2, 3, 0, 129, 255, 45, 0, 0, 51, 255,
++  120, 0, 3, 0, 0, 0, 0, 30, 255, 52, 0, 5, 1, 44, 255, 85, 0, 7, 7, 0, 94, 255, 38, 1,
++  2, 0, 0, 0, 30, 255, 52, 0, 5, 0, 197, 193, 0, 4, 0, 0, 4, 0, 201, 189, 0, 3, 0, 0,
++  0, 30, 255, 52, 0, 0, 58, 255, 45, 1, 3, 0, 0, 3, 1, 53, 255, 50, 1, 3, 0, 0, 30, 255,
++  52, 0, 0, 183, 198, 0, 3, 0, 0, 0, 0, 2, 0, 206, 174, 0, 3, 0, 0, 30, 255, 53, 0, 27,
++  255, 74, 1, 3, 0, 0, 0, 0, 4, 1, 83, 254, 19, 0, 1, 0, 30, 255, 56, 1, 128, 237, 3, 1,
++  1, 0, 0, 0, 0, 1, 0, 5, 242, 116, 1, 4, 0, 30, 255, 53, 0, 224, 149, 0, 4, 0, 0, 0,
++  0, 0, 0, 4, 0, 159, 215, 0, 2, 0, 30, 255, 41, 30, 255, 51, 0, 3, 0, 0, 0, 0, 0, 0,
++  3, 0, 59, 255, 34, 0, 0, 30, 255, 30, 116, 232, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3,
++  236, 116, 0, 0, 31, 254, 43, 211, 157, 2, 6, 2, 2, 2, 2, 2, 2, 2, 2, 6, 2, 165, 211, 1,
++  0, 31, 252, 52, 200, 59, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65, 206, 5, 0, 32, 255,
++  82, 48, 41, 39, 39, 39, 39, 39, 39, 39, 39, 39, 39, 39, 39, 40, 39, 0, 0, 24, 242, 255, 252, 255,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 254, 255, 208, 7, 0, 0, 29, 41, 42, 42, 41, 42, 41,
++  41, 41, 41, 41, 41, 41, 41, 42, 41, 42, 29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr uint8_t it_sequence_glyph[289] = {
++  0, 12, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0, 161, 52, 0, 2, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 181, 61, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 5,
++  125, 114, 3, 0, 176, 59, 0, 2, 0, 0, 0, 0, 0, 0, 2, 0, 33, 255, 255, 25, 0, 177, 59, 0,
++  2, 0, 0, 0, 0, 0, 0, 2, 4, 3, 112, 102, 2, 0, 177, 59, 0, 2, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 177, 59, 0, 2, 0, 0, 0, 0, 1, 0, 35, 76, 1, 4, 4, 0, 0,
++  177, 59, 0, 2, 0, 0, 0, 1, 5, 1, 209, 255, 77, 0, 4, 0, 0, 177, 59, 0, 2, 0, 0, 0,
++  0, 0, 0, 126, 195, 36, 0, 2, 0, 0, 177, 59, 0, 2, 0, 4, 2, 6, 67, 10, 0, 0, 0, 0,
++  0, 0, 0, 177, 59, 2, 4, 0, 0, 0, 129, 255, 145, 2, 5, 1, 0, 0, 0, 0, 177, 57, 0, 0,
++  0, 97, 53, 74, 213, 92, 0, 3, 0, 0, 0, 0, 0, 177, 58, 148, 175, 80, 255, 234, 0, 3, 0, 2,
++  2, 2, 2, 2, 1, 0, 172, 60, 225, 255, 49, 156, 110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 189,
++  93, 97, 122, 43, 37, 37, 49, 50, 49, 49, 49, 49, 49, 50, 18, 0, 116, 184, 170, 168, 183, 185, 184, 182,
++  182, 182, 182, 182, 182, 180, 182, 68, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0,
++};
++constexpr uint8_t it_sequence_glyph_big[441] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 85, 132,
++  0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 123, 194, 0, 4, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 26, 0, 0, 0, 115, 182, 0, 4, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 2, 0, 139, 241, 134, 0, 0, 116, 184, 0, 4, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 1, 1, 221, 255, 214, 0, 0, 116, 184, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  2, 0, 61, 160, 58, 0, 0, 116, 184, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 2, 1, 0,
++  0, 0, 0, 0, 116, 184, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 2, 0,
++  0, 116, 184, 0, 4, 0, 0, 0, 0, 0, 0, 1, 1, 8, 151, 183, 31, 1, 1, 0, 0, 0, 116, 184,
++  0, 4, 0, 0, 0, 0, 0, 0, 4, 0, 59, 255, 255, 130, 0, 4, 0, 0, 0, 116, 184, 0, 4, 0,
++  0, 0, 0, 0, 2, 0, 1, 16, 181, 211, 46, 0, 2, 0, 0, 0, 116, 184, 0, 4, 0, 0, 0, 0,
++  0, 0, 14, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 116, 184, 0, 5, 1, 0, 3, 6, 2, 73, 229,
++  182, 12, 2, 0, 2, 0, 0, 0, 0, 0, 116, 184, 1, 3, 0, 1, 0, 0, 0, 154, 255, 255, 37, 0,
++  2, 0, 0, 0, 0, 0, 0, 116, 185, 0, 5, 6, 0, 90, 179, 59, 31, 171, 116, 1, 2, 0, 0, 0,
++  0, 0, 0, 0, 118, 179, 15, 203, 212, 47, 234, 255, 204, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 120, 169, 60, 255, 255, 103, 128, 234, 109, 5, 10, 7, 4, 4, 4, 4, 4, 4, 4, 1, 0, 117, 173,
++  0, 137, 146, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 111, 247, 168, 160, 158,
++  168, 173, 168, 174, 172, 172, 172, 172, 172, 172, 172, 172, 171, 170, 41, 0, 29, 116, 129, 133, 133, 131, 131, 131,
++  131, 130, 130, 130, 130, 130, 130, 130, 130, 130, 127, 28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr uint8_t it_regression_glyph[289] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 0,
++  0, 7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, 81, 193, 20, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 3, 2, 110, 187, 235, 255, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 7, 0,
++  148, 255, 196, 110, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 51, 195, 112, 0, 0, 2, 0, 0,
++  0, 0, 0, 2, 3, 2, 4, 73, 130, 255, 144, 0, 5, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20,
++  255, 247, 178, 55, 3, 3, 0, 0, 0, 0, 0, 2, 3, 55, 66, 20, 182, 153, 43, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 196, 255, 235, 176, 0, 0, 3, 1, 0, 0, 0, 0, 0, 1, 2, 22, 69, 173,
++  216, 246, 163, 3, 5, 0, 0, 0, 0, 0, 0, 0, 5, 0, 113, 255, 172, 10, 29, 16, 0, 1, 0, 0,
++  0, 0, 0, 0, 0, 2, 55, 214, 141, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 123,
++  87, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0,
++};
++constexpr uint8_t it_regression_glyph_big[441] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 2, 2, 0, 0, 6, 63, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 21, 68, 205, 178, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 5, 156,
++  187, 208, 255, 173, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 13, 233, 255, 255, 229,
++  44, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 11, 212, 207, 49, 16, 0, 1, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 77, 208, 170, 11, 0, 0, 1, 0, 0, 0, 0, 0,
++  0, 0, 1, 2, 0, 2, 10, 128, 154, 255, 255, 34, 0, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 6, 0, 44, 255, 255, 189, 171, 17, 2, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 4, 33, 0, 24,
++  197, 200, 111, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 4, 173, 247, 122, 222, 158, 2, 0,
++  2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 167, 255, 255, 255, 111, 0, 7, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 2, 3, 90, 132, 175, 207, 146, 235, 95, 1, 3, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 1, 1, 0, 227, 255, 189, 13, 0, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  2, 0, 89, 242, 160, 10, 0, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 78, 241,
++  74, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 22, 23, 0, 4, 1,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr uint8_t it_statistics_glyph[289] = {
++  0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 9, 7, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 154, 228, 190, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 3, 0, 177, 255, 219, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 7, 4, 172, 253, 210, 47,
++  59, 45, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 172, 255, 207, 206, 255, 198, 0, 2, 0, 0, 0,
++  0, 2, 0, 76, 134, 113, 181, 255, 208, 198, 253, 191, 0, 2, 0, 0, 0, 0, 5, 0, 158, 255, 234, 190,
++  255, 208, 199, 255, 192, 1, 3, 1, 0, 0, 1, 6, 1, 145, 251, 214, 189, 255, 208, 199, 255, 192, 0, 0,
++  0, 0, 0, 0, 0, 0, 146, 255, 218, 189, 255, 208, 199, 255, 196, 165, 201, 129, 0, 0, 90, 197, 176, 174,
++  255, 220, 189, 255, 208, 199, 255, 197, 220, 255, 172, 0, 0, 123, 255, 240, 184, 255, 220, 189, 255, 208, 199, 255,
++  197, 208, 252, 162, 0, 0, 114, 249, 224, 179, 252, 217, 187, 252, 205, 196, 252, 195, 207, 252, 162, 0, 0, 124,
++  255, 243, 193, 255, 234, 201, 255, 221, 211, 255, 209, 223, 255, 174, 0, 0, 37, 81, 73, 58, 81, 70, 60, 81,
++  66, 63, 81, 63, 67, 81, 52, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0,
++};
++constexpr uint8_t it_statistics_glyph_big[441] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 3, 3, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
++  54, 59, 59, 13, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 13, 241, 255, 255,
++  58, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 13, 232, 253, 253, 56, 0, 3,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 13, 233, 255, 255, 56, 0, 2, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 2, 14, 233, 255, 245, 141, 213, 213, 163, 0, 2, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 7, 234, 255, 243, 162, 255, 255, 202, 0, 2, 0, 0, 0, 0, 0, 0,
++  3, 0, 104, 192, 191, 135, 220, 255, 243, 157, 253, 253, 193, 0, 2, 0, 0, 0, 0, 0, 0, 4, 0, 145,
++  255, 255, 183, 215, 255, 243, 158, 255, 255, 195, 3, 6, 4, 1, 0, 0, 0, 2, 6, 2, 137, 252, 252, 173,
++  216, 255, 243, 158, 255, 255, 195, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 137, 255, 255, 175, 216, 255, 243,
++  158, 255, 255, 193, 79, 103, 102, 35, 0, 0, 6, 42, 46, 38, 143, 255, 255, 175, 216, 255, 243, 158, 255, 255,
++  191, 212, 255, 255, 93, 0, 0, 36, 254, 255, 229, 166, 255, 255, 175, 216, 255, 243, 158, 255, 255, 191, 195, 251,
++  251, 86, 0, 0, 36, 253, 255, 228, 166, 255, 255, 175, 216, 255, 243, 158, 255, 255, 191, 198, 255, 255, 87, 0,
++  0, 36, 251, 253, 226, 165, 253, 253, 174, 215, 253, 241, 157, 253, 253, 190, 197, 253, 253, 86, 0, 0, 37, 255,
++  255, 234, 171, 255, 255, 180, 222, 255, 250, 162, 255, 255, 196, 204, 255, 255, 89, 0, 0, 32, 224, 226, 202, 147,
++  226, 226, 155, 192, 226, 216, 140, 226, 226, 169, 176, 226, 226, 77, 0, 0, 1, 7, 7, 6, 4, 7, 7, 5,
++  6, 7, 6, 4, 7, 7, 5, 5, 7, 7, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr uint8_t it_distributions_glyph[289] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 53, 0, 1, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 104, 255, 105, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  1, 1, 14, 231, 254, 231, 14, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 92, 255, 248, 255, 95,
++  0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 187, 254, 249, 254, 187, 0, 2, 0, 0, 0, 0, 0,
++  0, 0, 2, 0, 32, 249, 254, 254, 254, 249, 34, 0, 2, 0, 0, 0, 0, 0, 0, 4, 0, 113, 255, 251,
++  255, 251, 255, 115, 0, 4, 0, 0, 0, 0, 0, 0, 1, 2, 207, 255, 252, 255, 252, 255, 207, 2, 1, 0,
++  0, 0, 0, 0, 3, 1, 58, 255, 253, 255, 255, 255, 253, 255, 60, 1, 3, 0, 0, 0, 0, 5, 0, 177,
++  255, 252, 255, 255, 255, 252, 255, 177, 0, 5, 0, 0, 0, 5, 0, 68, 255, 253, 255, 255, 255, 255, 255, 253,
++  255, 69, 0, 5, 0, 0, 0, 50, 228, 250, 250, 252, 252, 252, 252, 252, 250, 250, 229, 51, 0, 0, 10, 171,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 173, 12, 6, 87, 83, 80, 81, 81, 81, 81, 81,
++  81, 81, 81, 81, 80, 83, 88, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0,
++};
++constexpr uint8_t it_distributions_glyph_big[441] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 1, 4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0,
++  29, 142, 29, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 188, 255, 190,
++  0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 70, 255, 246, 255, 70, 0, 3,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 177, 254, 248, 254, 180, 0, 3, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 27, 245, 254, 253, 254, 246, 28, 0, 2, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 4, 0, 112, 255, 251, 255, 251, 255, 111, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 2, 0, 199, 255, 252, 255, 252, 255, 201, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0,
++  40, 251, 254, 255, 255, 255, 254, 252, 42, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 132, 255, 251,
++  255, 255, 255, 251, 255, 131, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 1, 7, 224, 255, 253, 255, 255, 255,
++  253, 255, 225, 9, 1, 1, 0, 0, 0, 0, 0, 0, 4, 0, 84, 255, 252, 255, 255, 255, 255, 255, 252, 255,
++  86, 0, 4, 0, 0, 0, 0, 0, 1, 4, 1, 207, 254, 252, 255, 255, 255, 255, 255, 252, 254, 207, 2, 4,
++  1, 0, 0, 0, 2, 7, 0, 104, 255, 252, 255, 255, 255, 255, 255, 255, 255, 252, 255, 106, 0, 7, 2, 0,
++  0, 0, 0, 67, 245, 251, 252, 253, 253, 253, 253, 253, 253, 253, 252, 251, 245, 68, 0, 0, 0, 1, 51, 146,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 147, 52, 1, 0, 170, 243, 225, 225, 226,
++  226, 226, 226, 226, 226, 226, 226, 226, 226, 226, 225, 225, 243, 174, 0, 0, 4, 3, 6, 7, 7, 7, 7, 7,
++  7, 7, 7, 7, 7, 7, 7, 7, 6, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr uint8_t it_inference_glyph[289] = {
++  0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
++  0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 70, 197, 71, 0, 2, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 1, 1, 25, 234, 139, 233, 25, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
++  4, 0, 148, 179, 0, 178, 148, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 6, 227, 58, 3, 56, 229,
++  8, 1, 1, 0, 0, 0, 0, 0, 0, 3, 1, 84, 215, 1, 3, 1, 215, 84, 1, 3, 0, 0, 0, 0,
++  0, 0, 3, 0, 181, 132, 0, 8, 0, 131, 183, 0, 3, 0, 0, 0, 0, 0, 1, 0, 15, 231, 39, 0,
++  4, 0, 37, 232, 16, 0, 1, 0, 0, 0, 0, 4, 1, 106, 199, 0, 2, 0, 2, 0, 199, 107, 1, 4,
++  0, 0, 0, 0, 3, 0, 211, 94, 0, 4, 0, 4, 0, 91, 214, 0, 3, 0, 0, 0, 6, 0, 76, 225,
++  7, 1, 1, 0, 1, 1, 6, 224, 78, 0, 6, 0, 0, 0, 6, 223, 126, 2, 7, 3, 3, 3, 7, 2,
++  122, 225, 6, 0, 0, 9, 51, 183, 255, 91, 0, 0, 0, 0, 0, 0, 0, 89, 255, 183, 52, 10, 112, 255,
++  255, 255, 161, 74, 77, 74, 74, 74, 77, 74, 159, 255, 255, 255, 118, 58, 165, 161, 165, 170, 173, 173, 173, 173,
++  173, 173, 173, 169, 165, 161, 165, 62, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0,
++};
++constexpr uint8_t it_inference_glyph_big[441] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 1, 0, 4, 56, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 7,
++  191, 255, 192, 9, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 126, 252, 56, 250,
++  127, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 12, 247, 118, 0, 117, 247, 11, 1,
++  1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 1, 96, 249, 12, 3, 11, 247, 100, 1, 4, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 202, 169, 0, 7, 0, 169, 205, 0, 2, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 2, 0, 35, 255, 64, 1, 6, 1, 64, 255, 35, 0, 2, 0, 0, 0, 0, 0, 0, 0,
++  0, 4, 1, 124, 235, 3, 1, 1, 1, 3, 234, 129, 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0,
++  217, 151, 0, 4, 0, 4, 0, 147, 220, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 1, 48, 255, 44, 0,
++  2, 0, 2, 0, 45, 255, 48, 1, 3, 0, 0, 0, 0, 0, 0, 4, 0, 161, 210, 0, 2, 0, 0, 0,
++  2, 0, 209, 166, 0, 3, 0, 0, 0, 0, 0, 2, 2, 18, 254, 94, 1, 4, 0, 0, 0, 4, 1, 90,
++  255, 18, 2, 2, 0, 0, 0, 0, 6, 0, 148, 227, 5, 1, 1, 0, 0, 0, 1, 1, 5, 227, 151, 0,
++  6, 0, 0, 1, 3, 0, 48, 254, 122, 0, 4, 0, 0, 0, 0, 0, 4, 0, 117, 255, 48, 0, 2, 1,
++  0, 0, 68, 228, 255, 115, 3, 6, 3, 2, 2, 2, 3, 6, 3, 112, 255, 228, 68, 0, 0, 58, 202, 254,
++  252, 251, 110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 108, 251, 252, 254, 203, 63, 70, 255, 255, 255, 255, 236,
++  201, 202, 201, 201, 201, 201, 201, 202, 201, 234, 255, 255, 255, 255, 78, 13, 84, 87, 87, 87, 94, 101, 101, 101,
++  101, 101, 101, 101, 101, 101, 95, 87, 87, 87, 85, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr uint8_t it_elements_glyph[289] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 0, 78, 238, 52, 0,
++  2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 157, 218, 2, 55, 176, 39, 9, 3, 1, 1, 1, 1, 1, 4,
++  7, 6, 7, 113, 161, 1, 78, 226, 138, 245, 45, 0, 0, 0, 2, 0, 139, 227, 164, 216, 156, 205, 2, 57,
++  173, 94, 169, 35, 15, 9, 14, 10, 14, 94, 156, 110, 148, 115, 157, 1, 80, 231, 138, 222, 150, 238, 157, 235,
++  160, 231, 154, 209, 157, 204, 160, 211, 2, 54, 166, 94, 160, 95, 154, 96, 152, 99, 149, 104, 150, 108, 145, 111,
++  150, 1, 84, 244, 145, 235, 150, 234, 153, 231, 156, 227, 161, 223, 166, 217, 168, 222, 2, 44, 132, 76, 127, 75,
++  117, 75, 116, 77, 114, 79, 111, 82, 108, 89, 120, 1, 0, 0, 0, 0, 1, 15, 6, 13, 6, 13, 7, 12,
++  7, 15, 0, 0, 0, 1, 4, 7, 4, 117, 255, 169, 255, 176, 254, 181, 250, 183, 255, 12, 4, 1, 0, 0,
++  2, 0, 44, 108, 64, 102, 67, 100, 69, 98, 70, 104, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 4, 3, 4, 3, 4, 3, 4, 3, 4, 0, 0,
++  0,
++};
++constexpr uint8_t it_elements_glyph_big[441] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 10, 4, 0, 41, 241, 178, 3, 6, 1, 0, 0, 0, 0, 0, 0, 0, 4, 3,
++  5, 4, 58, 241, 151, 0, 37, 218, 161, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 46,
++  218, 136, 0, 20, 146, 96, 89, 137, 21, 2, 2, 2, 2, 2, 2, 13, 136, 99, 83, 137, 58, 147, 88, 0,
++  51, 255, 196, 194, 255, 48, 0, 0, 0, 0, 0, 0, 29, 255, 212, 183, 255, 136, 255, 181, 0, 16, 129, 81,
++  79, 128, 24, 38, 17, 29, 32, 15, 38, 20, 124, 89, 72, 128, 47, 129, 75, 0, 45, 253, 177, 177, 253, 128,
++  255, 159, 225, 243, 146, 255, 136, 243, 194, 164, 253, 121, 253, 163, 0, 30, 188, 127, 127, 188, 83, 185, 103, 151,
++  164, 93, 185, 87, 180, 140, 116, 188, 83, 188, 117, 0, 26, 171, 114, 114, 171, 74, 171, 94, 139, 152, 85, 171,
++  79, 163, 127, 104, 171, 73, 171, 105, 0, 50, 255, 195, 195, 255, 136, 255, 165, 234, 253, 152, 255, 143, 255, 215,
++  181, 255, 134, 255, 179, 0, 6, 52, 32, 32, 52, 16, 44, 21, 34, 38, 19, 44, 17, 41, 31, 24, 44, 16,
++  52, 29, 0, 0, 0, 0, 0, 0, 2, 19, 7, 14, 16, 6, 19, 5, 17, 12, 8, 19, 0, 0, 0, 0,
++  0, 3, 2, 6, 3, 82, 255, 151, 220, 238, 142, 255, 133, 254, 202, 166, 255, 62, 3, 5, 0, 0, 0, 0,
++  3, 0, 62, 207, 116, 170, 185, 107, 207, 100, 198, 156, 127, 207, 46, 0, 2, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1,
++  1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr uint8_t it_code_glyph[289] = {
++  0, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 40, 163, 175, 176, 176, 176, 176, 176, 176, 176, 176, 176, 175,
++  164, 43, 0, 5, 210, 159, 121, 123, 119, 119, 119, 119, 119, 119, 119, 121, 118, 156, 213, 7, 20, 222, 11, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 222, 24, 19, 219, 27, 96, 38, 0, 8, 4, 4, 4, 4,
++  4, 5, 4, 28, 218, 23, 19, 221, 17, 167, 243, 47, 0, 2, 0, 0, 0, 0, 1, 0, 25, 219, 23, 19,
++  220, 29, 0, 153, 238, 69, 1, 2, 0, 0, 0, 1, 0, 25, 219, 23, 19, 219, 31, 1, 0, 195, 253, 12,
++  5, 5, 4, 4, 5, 0, 25, 219, 23, 19, 220, 29, 0, 148, 239, 74, 0, 0, 0, 0, 0, 0, 0, 25,
++  219, 23, 19, 221, 17, 164, 246, 51, 0, 29, 135, 135, 134, 135, 122, 2, 23, 220, 23, 19, 219, 27, 101, 41,
++  0, 6, 37, 171, 170, 169, 171, 154, 6, 26, 219, 23, 20, 221, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 7, 221, 24, 5, 212, 154, 115, 117, 114, 114, 114, 118, 118, 118, 118, 119, 112, 151, 215, 7, 0, 44,
++  168, 179, 180, 181, 181, 181, 181, 181, 181, 181, 180, 179, 169, 46, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 2,
++  0,
++};
++constexpr uint8_t it_code_glyph_big[441] = {
++  0, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 1, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 25, 26, 26,
++  26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 25, 0, 0, 1, 1, 36, 211, 252, 252, 253, 253, 253, 253,
++  253, 253, 253, 253, 253, 253, 253, 252, 252, 214, 40, 1, 0, 175, 214, 59, 61, 58, 57, 57, 57, 57, 57, 57,
++  57, 57, 57, 58, 60, 59, 208, 182, 0, 0, 205, 138, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 131, 211, 0, 0, 201, 148, 2, 39, 0, 2, 4, 2, 3, 3, 3, 3, 3, 3, 3, 7, 3,
++  141, 207, 0, 0, 203, 142, 5, 255, 158, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 4, 0, 140, 208, 0,
++  0, 202, 148, 1, 116, 255, 182, 12, 0, 1, 0, 0, 0, 0, 0, 0, 4, 0, 140, 208, 0, 0, 202, 147,
++  0, 0, 84, 248, 200, 32, 2, 1, 0, 0, 0, 0, 0, 4, 0, 140, 208, 0, 0, 202, 147, 0, 12, 0,
++  100, 255, 166, 0, 5, 1, 1, 1, 1, 1, 4, 0, 140, 208, 0, 0, 202, 147, 0, 0, 79, 244, 204, 36,
++  0, 0, 0, 0, 0, 0, 0, 4, 0, 140, 208, 0, 0, 202, 149, 0, 109, 255, 188, 15, 0, 5, 11, 11,
++  11, 11, 11, 10, 5, 0, 140, 208, 0, 0, 203, 142, 6, 255, 163, 2, 2, 2, 85, 248, 246, 248, 247, 248,
++  229, 20, 0, 141, 208, 0, 0, 201, 148, 2, 44, 0, 2, 6, 2, 31, 87, 86, 87, 86, 87, 80, 12, 2,
++  142, 207, 0, 0, 205, 139, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 131, 211, 0,
++  0, 178, 210, 53, 55, 52, 51, 51, 51, 52, 54, 54, 54, 54, 54, 54, 54, 52, 205, 185, 0, 1, 39, 216,
++  253, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 253, 253, 219, 43, 1, 1, 0, 2, 30, 31, 31,
++  32, 32, 32, 32, 32, 32, 32, 32, 32, 31, 31, 31, 3, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2,
++  2, 2, 2, 2, 2, 2, 1, 0, 0,
++};
++constexpr uint8_t it_settings_glyph[289] = {
++  0, 0, 0, 2, 2, 0, 1, 7, 15, 7, 1, 0, 2, 2, 0, 0, 0, 0, 0, 1, 0, 0, 7, 0,
++  135, 231, 131, 0, 7, 0, 0, 1, 0, 0, 0, 2, 0, 45, 49, 0, 8, 198, 255, 194, 8, 0, 49, 45,
++  0, 2, 0, 2, 1, 49, 241, 244, 144, 219, 254, 252, 254, 221, 146, 244, 241, 49, 1, 2, 2, 0, 50, 237,
++  255, 255, 255, 252, 255, 252, 255, 255, 255, 236, 50, 0, 2, 0, 7, 0, 138, 254, 247, 255, 255, 255, 255, 255,
++  247, 255, 142, 0, 7, 0, 0, 0, 1, 220, 254, 253, 239, 98, 44, 96, 237, 253, 254, 224, 3, 0, 0, 11,
++  134, 189, 255, 252, 255, 96, 0, 0, 0, 90, 255, 252, 255, 190, 134, 10, 19, 255, 255, 252, 255, 254, 32, 7,
++  8, 7, 28, 253, 255, 252, 255, 255, 21, 8, 135, 193, 255, 252, 255, 93, 0, 0, 0, 87, 255, 252, 255, 195,
++  138, 11, 0, 0, 2, 221, 254, 253, 237, 93, 40, 91, 235, 253, 254, 225, 5, 0, 0, 0, 7, 0, 140, 255,
++  247, 255, 255, 253, 255, 255, 247, 255, 143, 0, 7, 0, 2, 0, 50, 237, 255, 255, 255, 252, 255, 252, 255, 255,
++  255, 236, 50, 0, 2, 2, 1, 49, 241, 244, 147, 223, 255, 252, 255, 225, 149, 243, 241, 49, 1, 2, 0, 2,
++  0, 45, 49, 0, 10, 195, 255, 199, 11, 0, 49, 45, 0, 2, 0, 0, 0, 1, 0, 0, 7, 0, 132, 234,
++  137, 0, 7, 0, 0, 1, 0, 0, 0, 0, 0, 2, 2, 0, 1, 9, 19, 9, 1, 0, 2, 2, 0, 0,
++  0,
++};
++constexpr uint8_t it_settings_glyph_big[441] = {
++  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 2, 3, 0, 1, 3, 147, 184, 144, 2, 2, 0, 3, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
++  2, 0, 0, 242, 255, 237, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0, 142, 127, 0, 13, 104,
++  248, 250, 246, 103, 15, 0, 127, 142, 0, 2, 0, 0, 0, 2, 0, 142, 255, 255, 187, 222, 255, 255, 255, 255,
++  255, 225, 188, 255, 255, 142, 0, 2, 0, 0, 3, 0, 128, 255, 249, 255, 255, 252, 252, 251, 252, 252, 255, 255,
++  249, 255, 128, 0, 3, 0, 0, 1, 3, 0, 187, 255, 249, 253, 254, 255, 255, 255, 254, 253, 249, 255, 189, 0,
++  3, 1, 0, 0, 2, 0, 13, 222, 255, 253, 254, 255, 191, 147, 188, 255, 254, 253, 255, 226, 16, 0, 2, 0,
++  0, 0, 7, 102, 255, 252, 253, 255, 106, 0, 0, 0, 100, 254, 253, 252, 255, 109, 7, 0, 0, 0, 148, 223,
++  248, 254, 252, 255, 191, 0, 3, 5, 4, 0, 185, 255, 252, 254, 248, 224, 148, 0, 0, 203, 255, 254, 255, 251,
++  255, 140, 4, 5, 0, 5, 4, 133, 255, 251, 255, 253, 255, 205, 0, 0, 147, 228, 250, 254, 252, 255, 188, 0,
++  4, 5, 4, 0, 182, 255, 252, 254, 250, 228, 151, 0, 0, 1, 10, 107, 255, 252, 253, 254, 100, 0, 0, 0,
++  95, 253, 253, 252, 255, 113, 11, 1, 0, 0, 2, 0, 14, 224, 255, 253, 254, 255, 185, 141, 183, 255, 255, 253,
++  255, 228, 17, 0, 2, 0, 0, 1, 3, 0, 189, 255, 249, 253, 254, 255, 255, 255, 254, 253, 249, 255, 191, 0,
++  3, 1, 0, 0, 3, 0, 128, 255, 249, 255, 255, 252, 252, 251, 252, 252, 255, 255, 249, 255, 128, 0, 3, 0,
++  0, 2, 0, 142, 255, 255, 189, 227, 255, 255, 255, 255, 255, 229, 191, 255, 255, 142, 0, 2, 0, 0, 0, 2,
++  0, 142, 127, 0, 17, 107, 247, 251, 249, 112, 19, 0, 127, 142, 0, 2, 0, 0, 0, 0, 0, 1, 0, 0,
++  2, 0, 0, 237, 255, 242, 0, 0, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 3, 0, 2, 2,
++  149, 189, 152, 3, 2, 0, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++constexpr uint8_t it_umd_glyph[289] = {
++  0, 0, 1, 0, 0, 0, 11, 11, 11, 11, 11, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 104, 192, 234,
++  250, 252, 250, 234, 193, 107, 2, 0, 1, 0, 1, 2, 8, 179, 255, 255, 226, 154, 132, 154, 225, 255, 255, 183,
++  9, 2, 1, 3, 0, 140, 255, 255, 111, 56, 113, 130, 106, 51, 110, 253, 255, 145, 0, 3, 0, 22, 243, 255,
++  97, 89, 219, 231, 255, 255, 245, 82, 94, 255, 245, 25, 0, 0, 65, 255, 180, 59, 234, 109, 215, 255, 255, 255,
++  255, 54, 176, 255, 69, 0, 0, 73, 254, 83, 176, 173, 223, 227, 127, 215, 252, 254, 170, 81, 254, 78, 0, 0,
++  75, 255, 66, 208, 255, 255, 49, 0, 46, 254, 255, 214, 63, 255, 80, 0, 0, 74, 255, 68, 202, 253, 254, 99,
++  1, 95, 255, 254, 206, 65, 255, 80, 0, 0, 72, 255, 108, 130, 255, 249, 253, 208, 252, 249, 255, 136, 103, 255,
++  77, 0, 0, 76, 254, 219, 33, 222, 255, 255, 255, 255, 255, 226, 33, 215, 254, 80, 0, 0, 68, 255, 255, 168,
++  34, 172, 246, 255, 247, 175, 35, 164, 255, 255, 73, 0, 0, 23, 246, 250, 255, 197, 80, 70, 80, 70, 79, 193,
++  255, 250, 249, 26, 0, 3, 0, 144, 255, 245, 255, 236, 187, 168, 186, 234, 255, 245, 255, 149, 0, 3, 1, 2,
++  9, 183, 255, 255, 103, 73, 81, 73, 99, 255, 255, 187, 11, 2, 1, 0, 1, 0, 2, 110, 199, 233, 235, 235,
++  235, 233, 201, 112, 4, 0, 1, 0, 0, 0, 1, 0, 0, 0, 16, 18, 18, 18, 16, 0, 0, 0, 1, 0,
++  0,
++};
++constexpr uint8_t it_umd_glyph_big[441] = {
++  0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0,
++  3, 0, 24, 109, 163, 178, 181, 184, 182, 179, 164, 111, 26, 0, 2, 0, 0, 0, 0, 0, 3, 0, 97, 236,
++  255, 255, 255, 255, 255, 255, 255, 255, 255, 238, 101, 0, 3, 0, 0, 0, 3, 0, 101, 255, 255, 255, 210, 101,
++  48, 37, 48, 100, 208, 255, 254, 255, 107, 0, 3, 0, 2, 0, 35, 249, 251, 255, 132, 14, 97, 167, 186, 164,
++  91, 17, 127, 255, 250, 251, 39, 0, 2, 4, 0, 141, 255, 255, 125, 16, 220, 237, 251, 255, 255, 255, 212, 22,
++  118, 255, 255, 148, 0, 4, 1, 0, 201, 254, 199, 0, 231, 182, 79, 221, 255, 249, 249, 255, 226, 3, 193, 254,
++  206, 1, 1, 0, 3, 217, 255, 71, 123, 222, 78, 251, 255, 239, 255, 255, 249, 255, 119, 66, 255, 223, 6, 0,
++  0, 3, 223, 254, 26, 209, 217, 223, 253, 102, 20, 99, 250, 252, 253, 207, 26, 252, 229, 6, 0, 0, 2, 227,
++  242, 26, 225, 255, 255, 209, 0, 0, 0, 204, 255, 255, 232, 26, 235, 233, 5, 0, 0, 3, 225, 250, 25, 215,
++  253, 252, 237, 39, 0, 35, 235, 253, 254, 221, 25, 246, 231, 6, 0, 0, 3, 219, 255, 47, 152, 255, 249, 255,
++  232, 169, 229, 255, 250, 255, 159, 42, 255, 224, 7, 0, 0, 4, 217, 255, 153, 27, 255, 254, 251, 255, 255, 255,
++  251, 253, 255, 32, 145, 255, 222, 7, 0, 0, 4, 221, 255, 254, 54, 80, 255, 255, 255, 252, 255, 255, 255, 87,
++  48, 253, 255, 226, 7, 0, 1, 0, 205, 254, 252, 240, 51, 50, 180, 240, 254, 241, 182, 53, 47, 237, 253, 254,
++  210, 1, 1, 4, 0, 143, 255, 249, 255, 254, 128, 34, 28, 36, 28, 33, 124, 252, 255, 249, 255, 150, 0, 4,
++  2, 0, 37, 250, 253, 252, 255, 255, 255, 224, 205, 223, 255, 255, 255, 252, 252, 252, 42, 0, 2, 0, 3, 0,
++  106, 255, 254, 250, 169, 44, 56, 56, 56, 44, 164, 250, 253, 255, 112, 0, 3, 0, 0, 0, 3, 0, 102, 240,
++  255, 239, 179, 179, 177, 179, 179, 236, 255, 241, 107, 0, 3, 0, 0, 0, 0, 0, 2, 0, 28, 115, 178, 206,
++  206, 207, 206, 206, 179, 117, 31, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0,
++  0, 0, 0, 0, 3, 0, 0, 0, 0,
++};
++constexpr const uint8_t* k_glyph[] = {it_calculation_glyph, it_solver_glyph, it_finance_glyph, it_graph_glyph, it_sequence_glyph, it_regression_glyph, it_statistics_glyph, it_distributions_glyph, it_inference_glyph, it_elements_glyph, it_code_glyph, it_settings_glyph, it_umd_glyph};
++constexpr const uint8_t* k_glyphBig[] = {it_calculation_glyph_big, it_solver_glyph_big, it_finance_glyph_big, it_graph_glyph_big, it_sequence_glyph_big, it_regression_glyph_big, it_statistics_glyph_big, it_distributions_glyph_big, it_inference_glyph_big, it_elements_glyph_big, it_code_glyph_big, it_settings_glyph_big, it_umd_glyph_big};
++
++}  // namespace SwitchIcons
++}  // namespace Home
+diff --git a/epsilon/escher/include/escher/app.h b/epsilon/escher/include/escher/app.h
+index 269ea7b590..8845dd2471 100644
+--- a/epsilon/escher/include/escher/app.h
++++ b/epsilon/escher/include/escher/app.h
+@@ -89,6 +89,9 @@ class App : public Responder {
+   virtual bool canStoreLayout() const { return false; }
+   virtual void storeLayout(const Poincare::Layout& layout = {}) {}
+   virtual int numberOfTimers() { return 0; }
++  // PSP-OS animations, see RunLoop. Return true to redraw the window.
++  virtual int animationPeriod() { return 0; }
++  virtual bool animationFrame() { return false; }
+   virtual Timer* timerAtIndex(int i) {
+     assert(false);
+     return nullptr;
+diff --git a/epsilon/escher/include/escher/container.h b/epsilon/escher/include/escher/container.h
+index 2a0cd8ce22..b7f005903d 100644
+--- a/epsilon/escher/include/escher/container.h
++++ b/epsilon/escher/include/escher/container.h
+@@ -37,6 +37,8 @@ class Container : public RunLoop {
+ 
+  private:
+   int numberOfTimers() override;
++  int animationPeriod() override;
++  void animationFrame() override;
+   Timer* timerAtIndex(int i) override;
+   virtual int numberOfContainerTimers();
+   virtual Timer* containerTimerAtIndex(int i);
+diff --git a/epsilon/escher/include/escher/run_loop.h b/epsilon/escher/include/escher/run_loop.h
+index 3c028526fe..40e32ba36b 100644
+--- a/epsilon/escher/include/escher/run_loop.h
++++ b/epsilon/escher/include/escher/run_loop.h
+@@ -16,6 +16,10 @@ class RunLoop {
+   virtual int numberOfTimers();
+   virtual Timer* timerAtIndex(int i);
+   virtual void listenToExternalEvents() = 0;
++  /* PSP-OS animations: when animationPeriod() > 0 (in ms), events are waited
++   * for at most that long and animationFrame() is called on every step. */
++  virtual int animationPeriod() { return 0; }
++  virtual void animationFrame() {}
+ 
+  private:
+   // Returns true while the Termination event is not fired.
+diff --git a/epsilon/escher/include/escher/theme/light_theme.h b/epsilon/escher/include/escher/theme/light_theme.h
+index 4d5f8cf5ec..e4246c442b 100644
+--- a/epsilon/escher/include/escher/theme/light_theme.h
++++ b/epsilon/escher/include/escher/theme/light_theme.h
+@@ -27,7 +27,7 @@ constexpr static ThemeContainer k_lightTheme =
+                    .InactiveTabSelected = Palette::SelectDark,
+                    .SurfaceSelect = Palette::Select,
+                    .SurfaceSelectApps = Palette::YellowDark,
+-                   .TitleBar = Palette::YellowDark,
++                   .TitleBar = KDSpecialColors::k_lightThemeMain,
+                    .BannerPurple = Palette::PurpleBright,
+                    .BannerElements = Palette::GrayWhite,
+                    .BannerGrayMiddle = Palette::GrayMiddle,
+@@ -60,7 +60,7 @@ constexpr static ThemeContainer k_lightTheme =
+                    .BorderPurple = Palette::PurpleBright,
+                    .BorderBoxTitleCell = Palette::PurpleDark,
+                    .BorderElementsBanner = Palette::GrayMiddle,
+-                   .SeparatorTitleBar = Palette::YellowDark,
++                   .SeparatorTitleBar = KDSpecialColors::k_lightThemeMain,
+                    .SeparatorTitleHeaders = Palette::Black,
+                    .ButtonLightBorderMain = Palette::GrayBright,
+                    .ButtonLightBorderBottom = Palette::GrayWhite,
+diff --git a/epsilon/escher/src/container.cpp b/epsilon/escher/src/container.cpp
+index a368cec4cc..0a9757b6de 100644
+--- a/epsilon/escher/src/container.cpp
++++ b/epsilon/escher/src/container.cpp
+@@ -44,6 +44,16 @@ bool Container::dispatchEvent(Ion::Events::Event event) {
+   return false;
+ }
+ 
++int Container::animationPeriod() {
++  return s_activeApp ? s_activeApp->animationPeriod() : 0;
++}
++
++void Container::animationFrame() {
++  if (s_activeApp && s_activeApp->animationFrame()) {
++    window()->redraw();
++  }
++}
++
+ void Container::run() {
+   window()->redraw();
+   RunLoop::run();
+diff --git a/epsilon/escher/src/run_loop.cpp b/epsilon/escher/src/run_loop.cpp
+index c20471d407..0b335f97e1 100644
+--- a/epsilon/escher/src/run_loop.cpp
++++ b/epsilon/escher/src/run_loop.cpp
+@@ -36,6 +36,10 @@ bool RunLoop::step() {
+ 
+   // Fetch the event, if any
+   int eventDuration = Timer::TickDuration;
++  int animation = animationPeriod();
++  if (animation > 0 && animation < eventDuration) {
++    eventDuration = animation;
++  }
+   int timeout = eventDuration;
+ 
+   Ion::Events::Event event = Ion::Events::getEvent(&timeout);
+@@ -85,6 +89,10 @@ bool RunLoop::step() {
+     dispatchEvent(event);
+   }
+ 
++  if (animation > 0 && event != Ion::Events::Termination) {
++    animationFrame();
++  }
++
+   return event != Ion::Events::Termination;
+ }
+ 
+diff --git a/shared/kandinsky/include/kandinsky/color.h b/shared/kandinsky/include/kandinsky/color.h
+index aa6dcf3fa1..a2ddfd0ee2 100644
+--- a/shared/kandinsky/include/kandinsky/color.h
++++ b/shared/kandinsky/include/kandinsky/color.h
+@@ -82,7 +82,7 @@ constexpr KDColor KDWhite = KDColor::RGB24(0xFFFFFF);
+  * kernel. */
+ namespace KDSpecialColors {
+ // Theme (light / dark) signature colors (used for example in the title bar)
+-constexpr KDColor k_lightThemeMain = KDColor::RGB24(0xFFB734);
++constexpr KDColor k_lightThemeMain = KDColor::RGB24(0xE60012);  // Switch-OS red
+ constexpr KDColor k_darkThemeMain = KDColor::RGB24(0xC3CAF4);
+ // Theme (light / dark) neutral colors (black or white)
+ constexpr KDColor k_lightThemeNeutral = KDWhite;
